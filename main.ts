@@ -28,7 +28,7 @@ export default class ObsidianImmich extends Plugin {
 			id: 'insert-from-immich',
 			name: 'Insert from Immich',
 			editorCallback: (editor: Editor) => {
-				new SampleModal(this.app).open();
+				new ImageSelectorModal(this.app, editor, this.settings).open();
 			}
 		});
 
@@ -48,14 +48,19 @@ export default class ObsidianImmich extends Plugin {
 	}
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
+class ImageSelectorModal extends Modal {
+	editor: Editor;
+	settings: PluginSettings;
+
+	constructor(app: App, editor: Editor, settings: PluginSettings) {
 		super(app);
+		this.editor = editor;
+		this.settings = settings;
 	}
 
 	onOpen() {
 		const {contentEl} = this;
-		contentEl.setText('Woah!');
+		contentEl.setText("Working with " +  this.settings.immichUrl);
 	}
 
 	onClose() {
