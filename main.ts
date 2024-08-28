@@ -2,16 +2,18 @@ import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Set
 
 // Remember to rename these classes and interfaces!
 
-interface MyPluginSettings {
-	mySetting: string;
+interface PluginSettings {
+	immichUrl: string;
+	immichApiKey: string;
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+const DEFAULT_SETTINGS: PluginSettings = {
+	immichUrl: '',
+	immichApiKey: ''
 }
 
 export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+	settings: PluginSettings;
 
 	async onload() {
 		await this.loadSettings();
@@ -121,13 +123,21 @@ class SampleSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
+			.setName('Immich URL')
+			.setDesc('Full URL to your immich instance.')
 			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
+				.setValue(this.plugin.settings.immichUrl)
 				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
+					this.plugin.settings.immichUrl = value;
+					await this.plugin.saveSettings();
+				}));
+		new Setting(containerEl)
+			.setName('Immich API Key')
+			.setDesc('Obtained from {IMMICH_URL}/user-settings?isOpen=api-keys.')
+			.addText(text => text
+				.setValue(this.plugin.settings.immichApiKey)
+				.onChange(async (value) => {
+					this.plugin.settings.immichApiKey = value;
 					await this.plugin.saveSettings();
 				}));
 	}
