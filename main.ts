@@ -1,4 +1,4 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, requestUrl } from 'obsidian';
 
 // Remember to rename these classes and interfaces!
 
@@ -31,7 +31,7 @@ export default class ObsidianImmich extends Plugin {
 				new ImageSelectorModal(this.app, editor, this.settings).open();
 			}
 		});
-
+ 
 		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new SettingTab(this.app, this));
 	}
@@ -58,9 +58,31 @@ class ImageSelectorModal extends Modal {
 		this.settings = settings;
 	}
 
-	onOpen() {
+	async onOpen() {
 		const {contentEl} = this;
-		contentEl.setText("Working with " +  this.settings.immichUrl);
+		const url = new URL(this.settings.immichUrl + '/api/assets/random');
+		const result = await requestUrl({
+			url: url.toString(),
+			headers: {
+				'Accept': 'application/json',
+				'x-api-key': this.settings.immichApiKey.toString()
+			}
+		})
+
+		console.log(result.json)
+		const url2 = new URL(this.settings.immichUrl + '/api/assets/' + result.json[0]['id'] + '/thumbnail');
+		const result2 = await requestUrl({
+			url: url2.toString(),
+			headers: {
+				'Accept': 'application/octet-stream',
+				'x-api-key': this.settings.immichApiKey.toString()
+			}
+		})
+		const img = new Image()
+		img.src = URL.createObjectURL(new Blob([result2.arrayBuffer]))
+
+		// Now display the result
+		contentEl.createEl("img").src = img.src;
 	}
 
 	onClose() {
