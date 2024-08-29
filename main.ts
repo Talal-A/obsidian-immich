@@ -64,7 +64,8 @@ class ImageSelectorModal extends Modal {
 
 	async onOpen() {
 		const {contentEl} = this;
-		const url = new URL(this.settings.immichUrl + '/api/assets/random');
+
+		const url = new URL(this.settings.immichUrl + '/api/albums/' + this.settings.immichAlbum);
 		const result = await requestUrl({
 			url: url.toString(),
 			headers: {
@@ -73,20 +74,15 @@ class ImageSelectorModal extends Modal {
 			}
 		})
 
-		console.log(result.json)
-		const url2 = new URL(this.settings.immichUrl + '/api/assets/' + result.json[0]['id'] + '/thumbnail');
-		const result2 = await requestUrl({
-			url: url2.toString(),
-			headers: {
-				'Accept': 'application/octet-stream',
-				'x-api-key': this.settings.immichApiKey.toString()
-			}
-		})
-		const img = new Image()
-		img.src = URL.createObjectURL(new Blob([result2.arrayBuffer]))
-
-		// Now display the result
-		contentEl.createEl("img").src = img.src;
+		for (let i = 0; i < result.json['assets'].length; i++) {
+			const thumbUrl = this.settings.immichUrl + '/api/assets/' + result.json['assets'][i]['id'] + '/thumbnail?size=thumbnail&key=' + this.settings.immichAlbumKey;
+			const previewUrl = this.settings.immichUrl + '/api/assets/' + result.json['assets'][i]['id'] + '/thumbnail?size=preview&key=' + this.settings.immichAlbumKey;
+			const insertionText = '![](' + previewUrl + ')\n';
+			const imgElement = contentEl.createEl("img");
+			imgElement.src = thumbUrl;
+			imgElement.width = 250;
+			imgElement.onclick = () => this.editor.replaceRange(insertionText, this.editor.getCursor());
+		}
 	}
 
 	onClose() {
