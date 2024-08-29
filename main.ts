@@ -5,11 +5,15 @@ import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Set
 interface PluginSettings {
 	immichUrl: string;
 	immichApiKey: string;
+	immichAlbum: string;
+	immichAlbumKey: string;
 }
 
 const DEFAULT_SETTINGS: PluginSettings = {
 	immichUrl: '',
-	immichApiKey: ''
+	immichApiKey: '',
+	immichAlbum: '',
+	immichAlbumKey: ''
 }
 
 export default class ObsidianImmich extends Plugin {
@@ -122,5 +126,25 @@ class SettingTab extends PluginSettingTab {
 					this.plugin.settings.immichApiKey = value;
 					await this.plugin.saveSettings();
 				}));
+		new Setting(containerEl)
+			.setName('Immich Album ID')
+			.setDesc('UUID for the `obsidian` album in immich.')
+			.addText(text => text
+				.setValue(this.plugin.settings.immichAlbum)
+				.onChange(async (value) => {
+					this.plugin.settings.immichAlbum = value;
+					await this.plugin.saveSettings();
+				}));
+		new Setting(containerEl)
+			.setName('Immich Album Share Key')
+			.setDesc('Share key which shows up in the URL of your album.')
+			.addText(text => text
+				.setValue(this.plugin.settings.immichAlbumKey)
+				.onChange(async (value) => {
+					this.plugin.settings.immichAlbumKey = value;
+					await this.plugin.saveSettings();
+				}));
+
+
 	}
 }
