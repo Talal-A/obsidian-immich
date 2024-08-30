@@ -77,6 +77,9 @@ class ImageSelectorModal extends Modal {
 			await refreshCacheFromImmich(this.settings);
 		}
 
+		// Get the width of the viewport
+		const totalWidth = contentEl.innerWidth;
+
 		const imageDiv = contentEl.createDiv();
 		const bottomDiv = contentEl.createDiv();
 		let observer = new IntersectionObserver(() => {
@@ -92,7 +95,7 @@ class ImageSelectorModal extends Modal {
 				const insertionText = '![](' + previewUrl + ')\n';
 				const imgElement = imageDiv.createEl("img");
 				imgElement.src = thumbUrl;
-				imgElement.width = 250;
+				imgElement.width = (totalWidth / 2) - 1;
 				imgElement.onclick = () => this.editor.replaceRange(insertionText, this.editor.getCursor());
 			}
 			
