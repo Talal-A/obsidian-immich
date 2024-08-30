@@ -42,6 +42,14 @@ export default class ObsidianImmich extends Plugin {
 			}
 		});
  
+		this.addCommand({
+			id: 'force-refresh-immich-cache',
+			name: 'Refresh immich cache',
+			callback: () => {
+				refreshCacheFromImmich(this.settings);
+			}
+		});
+
 		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new SettingTab(this.app, this));
 	}
