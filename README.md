@@ -2,16 +2,18 @@
 
 This plugin allows users to easily insert images from their self-hosted Immich instance into their Obsidian notes.
 
-# Features
+## Disclaimer
+Immich is still under **very active** development. Breaking changes have happened and will continue to happen! This plugin is confirmed working as of [v1.112.1](https://github.com/immich-app/immich/releases/tag/v1.112.1).
+
+## Features
 
 - View all images from a single shared album within Immich.
 - One-click insertion of one or many images into your vault.
 
-# Usage
+## Prerequisites 
+This assumes you have a working version of [immich](https://github.com/immich-app/immich) hosted. It does not necessarily need to be remotely accessible. This decision is left up to the reader.
 
 ## Setup
-
-- This assumes you have a working version of [immich](https://github.com/immich-app/immich) hosted. 
 
 **Immich**
 
@@ -34,3 +36,8 @@ This plugin allows users to easily insert images from their self-hosted Immich i
     - Immich API key: the key you just generated.
     - Immich Album ID: the UUID you obtained in step 2.
     - Immich Album Share Key: the Key you obtained in step 4.
+
+## Usage
+1. Open the command palette in Obsidian (`ctrl/cmd + p` or swipe down on mobile).
+1. Search `Immich`.
+1. Select `Immich: Insert from Immich` and click on the image(s) you want to include in your note.
