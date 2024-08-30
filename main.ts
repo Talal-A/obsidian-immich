@@ -61,11 +61,13 @@ export default class ObsidianImmich extends Plugin {
 class ImageSelectorModal extends Modal {
 	editor: Editor;
 	settings: PluginSettings;
+	page: number;
 
 	constructor(app: App, editor: Editor, settings: PluginSettings) {
 		super(app);
 		this.editor = editor;
 		this.settings = settings;
+		this.page = 0;
 	}
 
 	async onOpen() {
@@ -75,15 +77,27 @@ class ImageSelectorModal extends Modal {
 			await refreshCacheFromImmich(this.settings);
 		}
 
-		for (let i = 0; i < cachedResult.json.assets.length; i++) {
-			const thumbUrl = this.settings.immichUrl + '/api/assets/' + cachedResult.json['assets'][i]['id'] + '/thumbnail?size=thumbnail&key=' + this.settings.immichAlbumKey;
-			const previewUrl = this.settings.immichUrl + '/api/assets/' + cachedResult.json['assets'][i]['id'] + '/thumbnail?size=preview&key=' + this.settings.immichAlbumKey;
-			const insertionText = '![](' + previewUrl + ')\n';
-			const imgElement = contentEl.createEl("img");
-			imgElement.src = thumbUrl;
-			imgElement.width = 250;
-			imgElement.onclick = () => this.editor.replaceRange(insertionText, this.editor.getCursor());
-		}
+		const imageDiv = contentEl.createDiv();
+		const bottomDiv = contentEl.createDiv();
+		let observer = new IntersectionObserver(() => {
+			const startIndex = this.page;
+			let endIndex = this.page + 16;
+			if (endIndex > cachedResult.json['assets'].length) {
+				endIndex = cachedResult.json['assets'].length;
+			}
+			this.page = endIndex;
+			for (let i = startIndex; i < endIndex; i++) {
+				const thumbUrl = this.settings.immichUrl + '/api/assets/' + cachedResult.json['assets'][i]['id'] + '/thumbnail?size=thumbnail&key=' + this.settings.immichAlbumKey;
+				const previewUrl = this.settings.immichUrl + '/api/assets/' + cachedResult.json['assets'][i]['id'] + '/thumbnail?size=preview&key=' + this.settings.immichAlbumKey;
+				const insertionText = '![](' + previewUrl + ')\n';
+				const imgElement = imageDiv.createEl("img");
+				imgElement.src = thumbUrl;
+				imgElement.width = 250;
+				imgElement.onclick = () => this.editor.replaceRange(insertionText, this.editor.getCursor());
+			}
+			
+		}, {threshold: [0.1]});
+		observer.observe(bottomDiv);
 	}
 
 	onClose() {
