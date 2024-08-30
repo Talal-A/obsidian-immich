@@ -35,7 +35,7 @@ This assumes you have a working version of [immich](https://github.com/immich-ap
 6. Install the plugin.
 7. Fill in the following settings:
     - Immich URL: full url to your Immich instance. Do not include the trailing `/`.
-    - Immich API key: the key you just generated.
+    - Immich API key: the key you generated in step 5.
     - Immich Album ID: the UUID you obtained in step 2.
     - Immich Album Share Key: the Key you obtained in step 4.
 
