@@ -1,6 +1,4 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, requestUrl } from 'obsidian';
-
-// Remember to rename these classes and interfaces!
+import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, RequestUrlResponse, Setting, requestUrl } from 'obsidian';
 
 interface PluginSettings {
 	immichUrl: string;
@@ -16,17 +14,25 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	immichAlbumKey: ''
 }
 
+let cachedResult: RequestUrlResponse;
+
+async function refreshCacheFromImmich(settings: PluginSettings) {
+	const url = new URL(settings.immichUrl + '/api/albums/' + settings.immichAlbum);
+	const result = await requestUrl({
+		url: url.toString(),
+		headers: {
+			'Accept': 'application/json',
+			'x-api-key': settings.immichApiKey.toString()
+		}
+	})	
+	cachedResult = result;
+}
+
 export default class ObsidianImmich extends Plugin {
 	settings: PluginSettings;
 
 	async onload() {
 		await this.loadSettings();
-
-		// This creates an icon in the left ribbon. Currently used just for testing.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Immich', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
 
 		this.addCommand({
 			id: 'insert-from-immich',
@@ -65,18 +71,13 @@ class ImageSelectorModal extends Modal {
 	async onOpen() {
 		const {contentEl} = this;
 
-		const url = new URL(this.settings.immichUrl + '/api/albums/' + this.settings.immichAlbum);
-		const result = await requestUrl({
-			url: url.toString(),
-			headers: {
-				'Accept': 'application/json',
-				'x-api-key': this.settings.immichApiKey.toString()
-			}
-		})
+		if (cachedResult == null) {
+			await refreshCacheFromImmich(this.settings);
+		}
 
-		for (let i = 0; i < result.json['assets'].length; i++) {
-			const thumbUrl = this.settings.immichUrl + '/api/assets/' + result.json['assets'][i]['id'] + '/thumbnail?size=thumbnail&key=' + this.settings.immichAlbumKey;
-			const previewUrl = this.settings.immichUrl + '/api/assets/' + result.json['assets'][i]['id'] + '/thumbnail?size=preview&key=' + this.settings.immichAlbumKey;
+		for (let i = 0; i < cachedResult.json.assets.length; i++) {
+			const thumbUrl = this.settings.immichUrl + '/api/assets/' + cachedResult.json['assets'][i]['id'] + '/thumbnail?size=thumbnail&key=' + this.settings.immichAlbumKey;
+			const previewUrl = this.settings.immichUrl + '/api/assets/' + cachedResult.json['assets'][i]['id'] + '/thumbnail?size=preview&key=' + this.settings.immichAlbumKey;
 			const insertionText = '![](' + previewUrl + ')\n';
 			const imgElement = contentEl.createEl("img");
 			imgElement.src = thumbUrl;
@@ -101,7 +102,6 @@ class SettingTab extends PluginSettingTab {
 
 	display(): void {
 		const {containerEl} = this;
-
 		containerEl.empty();
 
 		new Setting(containerEl)
@@ -140,7 +140,5 @@ class SettingTab extends PluginSettingTab {
 					this.plugin.settings.immichAlbumKey = value;
 					await this.plugin.saveSettings();
 				}));
-
-
 	}
 }
