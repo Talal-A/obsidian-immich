@@ -3,7 +3,9 @@
 This plugin allows users to easily insert images from their self-hosted Immich instance into their Obsidian notes.
 
 ## Disclaimer
-Immich is still under **very active** development. Breaking changes have happened and will continue to happen! This plugin is confirmed working as of [v1.112.1](https://github.com/immich-app/immich/releases/tag/v1.112.1).
+⚠️ Immich is still under **very active** development. Breaking changes have happened and will continue to happen! This plugin is confirmed working as of [v1.112.1](https://github.com/immich-app/immich/releases/tag/v1.112.1). 
+
+⚠️ The 'Immich Album Share Key' you generate below should be kept private! Do not post this online unless you are comfortable making your entire `obsidian` immich album public. This issue will only impact you if your immich instance is publicly accessible.
 
 ## Features
 
