@@ -1,7 +1,7 @@
 {
-	"id": "obsidian-immich",
+	"id": "immich",
 	"name": "Immich",
-	"version": "0.0.2",
+	"version": "0.0.3",
 	"minAppVersion": "0.15.0",
 	"description": "Link your Immich images within Obsidian.",
 	"author": "Talal Abou Haiba",
