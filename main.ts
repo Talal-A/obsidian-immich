@@ -35,16 +35,16 @@ export default class ObsidianImmich extends Plugin {
 		await this.loadSettings();
 
 		this.addCommand({
-			id: 'insert-from-immich',
-			name: 'Insert from Immich',
+			id: 'insert-from-album',
+			name: 'Insert from album',
 			editorCallback: (editor: Editor) => {
 				new ImageSelectorModal(this.app, editor, this.settings).open();
 			}
 		});
  
 		this.addCommand({
-			id: 'force-refresh-immich-cache',
-			name: 'Refresh immich cache',
+			id: 'force-refresh-album-cache',
+			name: 'Refresh album cache',
 			callback: () => {
 				refreshCacheFromImmich(this.settings);
 			}
