@@ -99,8 +99,13 @@ class ImageSelectorModal extends Modal {
 			this.page = endIndex;
 			for (let i = startIndex; i < endIndex; i++) {
 				const thumbUrl = this.settings.immichUrl + '/api/assets/' + cachedResult.json['assets'][i]['id'] + '/thumbnail?size=thumbnail&key=' + this.settings.immichAlbumKey;
-				const previewUrl = this.settings.immichUrl + '/api/assets/' + cachedResult.json['assets'][i]['id'] + '/thumbnail?size=preview&key=' + this.settings.immichAlbumKey;
-				const insertionText = '![](' + previewUrl + ')\n';
+				let insertionText: string;
+				if (cachedResult.json['assets'][i]['type'] === "IMAGE") {
+					const previewUrl = this.settings.immichUrl + '/api/assets/' + cachedResult.json['assets'][i]['id'] + '/thumbnail?size=preview&key=' + this.settings.immichAlbumKey;
+					insertionText = '![](' + previewUrl + ')\n';
+				} else if (cachedResult.json['assets'][i]['type'] === "VIDEO") {
+					insertionText = '<video src="' + this.settings.immichUrl + '/api/assets/' + cachedResult.json['assets'][i]['id'] + '/video/playback?key=' + this.settings.immichAlbumKey + '"controls></video>\n';
+				}
 				const imgElement = imageDiv.createEl("img");
 				imgElement.src = thumbUrl;
 				imgElement.width = (totalWidth / 2) - 1;
