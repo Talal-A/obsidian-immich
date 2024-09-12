@@ -144,7 +144,7 @@ class SettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 		new Setting(containerEl)
-			.setName('Immich API Key')
+			.setName('Immich API key')
 			.setDesc('Obtained from {IMMICH_URL}/user-settings?isOpen=api-keys.')
 			.addText(text => text
 				.setValue(this.plugin.settings.immichApiKey)
@@ -153,7 +153,7 @@ class SettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 		new Setting(containerEl)
-			.setName('Immich Album ID')
+			.setName('Immich album ID')
 			.setDesc('UUID for the `obsidian` album in immich.')
 			.addText(text => text
 				.setValue(this.plugin.settings.immichAlbum)
@@ -162,7 +162,7 @@ class SettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 		new Setting(containerEl)
-			.setName('Immich Album Share Key')
+			.setName('Immich album share key')
 			.setDesc('Share key which shows up in the URL of your album.')
 			.addText(text => text
 				.setValue(this.plugin.settings.immichAlbumKey)
