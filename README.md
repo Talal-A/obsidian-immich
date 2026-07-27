@@ -14,6 +14,8 @@ This plugin allows users to easily insert images from their self-hosted Immich i
 ## Prerequisites 
 This assumes you have a working version of [immich](https://github.com/immich-app/immich) hosted. It does not necessarily need to be remotely accessible. This decision is left up to the reader.
 
+Immich v3 and later are supported, as are older releases that still return the album's assets inline.
+
 ## Demo
 
 https://github.com/user-attachments/assets/5ade12f7-c959-4991-9d6b-54bcb9569050
@@ -32,7 +34,8 @@ https://github.com/user-attachments/assets/5ade12f7-c959-4991-9d6b-54bcb9569050
    - Expire after: Never.
 4. Copy the share URL. Take note of the key: `https://your-immich-url.com/share/{{KEY}}`
 5. Finally, generate and copy down your API key: `https://your-immich-url.com/user-settings?isOpen=api-keys`
-    - The permissions currently used are: `server.about`, `album.read`. Please note that future updates may change this.
+    - The permissions currently used are: `server.about`, `album.read`, `asset.read`. Please note that future updates may change this.
+    - `asset.read` is required because Immich v3 removed the asset list from the album endpoint; the plugin now lists album assets via the search API.
 
 **Obsidian**
 
