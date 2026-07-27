@@ -1,4 +1,4 @@
-import { App, Editor, Modal, Notice, Plugin, PluginSettingTab, RequestUrlResponse, SecretComponent, Setting, requestUrl } from 'obsidian';
+import { App, Editor, Modal, Notice, Plugin, PluginSettingTab, RequestUrlParam, RequestUrlResponse, SecretComponent, Setting, requestUrl } from 'obsidian';
 
 interface PluginSettings {
 	immichUrl: string;
@@ -78,6 +78,36 @@ function apiHeaders(creds: ImmichCredentials): Record<string, string> {
 	};
 }
 
+// The permissions the plugin's API key needs. `asset.read` is the one that
+// existing keys tend to lack, since it only became necessary when Immich v3
+// moved album listing to the search API.
+const REQUIRED_PERMISSIONS = 'server.about, album.read, and asset.read';
+
+function describeHttpFailure(status: number, context: string): string {
+	switch (status) {
+		case 401:
+			return 'Immich rejected the API key (401) while ' + context + '. Check the API key in the plugin settings.';
+		case 403:
+			return 'Immich denied access (403) while ' + context + '. The API key is most likely missing a ' +
+				'required permission - this plugin needs ' + REQUIRED_PERMISSIONS + '.';
+		case 404:
+			return 'Immich returned not found (404) while ' + context + '. Check the Immich URL and album ID.';
+		default:
+			return 'Immich returned status ' + status + ' while ' + context + '.';
+	}
+}
+
+// requestUrl throws its own opaque "Request failed, status NNN" for any 4xx/5xx,
+// which hides which permission or setting is actually at fault. Handle the
+// status directly so the failure can be explained in terms the user can act on.
+async function immichRequest(params: RequestUrlParam, context: string): Promise<RequestUrlResponse> {
+	const result = await requestUrl({ ...params, throw: false });
+	if (result.status < 200 || result.status >= 300) {
+		throw new Error(describeHttpFailure(result.status, context));
+	}
+	return result;
+}
+
 function hasLegacyPlaintextSecrets(settings: PluginSettings): boolean {
 	return !!(settings.immichApiKey || settings.immichAlbumKey);
 }
@@ -95,6 +125,10 @@ function availableSecretId(app: App, preferredId: string): string {
 	throw new Error('Could not find an unused secret ID for ' + preferredId);
 }
 
+function describeException(exception: unknown): string {
+	return exception instanceof Error ? exception.message : String(exception);
+}
+
 async function testConnection(creds: ImmichCredentials) {
 	const url = new URL(creds.immichUrl + '/api/server/about');
 	console.log('[Immich] Testing connection to:', url.toString());
@@ -103,10 +137,10 @@ async function testConnection(creds: ImmichCredentials) {
 	new Notice("Testing connection to " + url);
 	try {
 		const startTime = Date.now();
-		const result = await requestUrl({
+		const result = await immichRequest({
 			url: url.toString(),
 			headers: apiHeaders(creds)
-		})
+		}, 'contacting the server')
 		const duration = Date.now() - startTime;
 
 		console.log('[Immich] Connection response:', {
@@ -132,17 +166,17 @@ async function testConnection(creds: ImmichCredentials) {
 				hasApiKey: !!creds.immichApiKey
 			}
 		});
-		new Notice("Failed to connect to " + creds.immichUrl + " - check the console for additional information.")
+		new Notice("Failed to connect to " + creds.immichUrl + ". " + describeException(exception))
 	}	
 	const url2 = new URL(creds.immichUrl + '/api/albums/' + creds.immichAlbum);
 	console.log('[Immich] Testing album access with URL:', url2.toString());
 	let albumResult: RequestUrlResponse | null = null;
 	try {
 		const startTime = Date.now();
-		const result = await requestUrl({
+		const result = await immichRequest({
 			url: url2.toString(),
 			headers: apiHeaders(creds)
-		})
+		}, 'loading the album')
 		const duration = Date.now() - startTime;
 		
 		console.log('[Immich] Album access response:', {
@@ -170,7 +204,7 @@ async function testConnection(creds: ImmichCredentials) {
 				albumId: creds.immichAlbum
 			}
 		});
-		new Notice("Failed to access album - check the console for additional information.")
+		new Notice("Failed to access album. " + describeException(exception))
 	}
 	// If there is an item in the album, also test access to the first asset to verify that the album key is correct.
 	// Immich v3 no longer inlines the assets in the album response, so look them up separately when needed.
@@ -184,7 +218,7 @@ async function testConnection(creds: ImmichCredentials) {
 			}
 		} catch (exception) {
 			console.error('[Immich] Failed to list album assets:', exception);
-			new Notice("Failed to list album assets - check the console for additional information.");
+			new Notice("Failed to list album assets. " + describeException(exception));
 		}
 	}
 	if (firstAsset) {
@@ -193,10 +227,10 @@ async function testConnection(creds: ImmichCredentials) {
 		console.log('[Immich] Testing asset access with URL:', url3.toString());
 		try {
 			const startTime = Date.now();
-			const result = await requestUrl({
+			const result = await immichRequest({
 				url: url3.toString(),
 				headers: apiHeaders(creds)
-			})
+			}, 'reading an asset thumbnail')
 			const duration = Date.now() - startTime;
 			
 			console.log('[Immich] Asset access response:', {
@@ -224,7 +258,7 @@ async function testConnection(creds: ImmichCredentials) {
 					albumKey: creds.immichAlbumKey
 				}
 			});
-			new Notice("Failed to access asset - check the console for additional information. This may indicate an issue with the album key.");
+			new Notice("Failed to access asset. " + describeException(exception) + " This may also indicate an issue with the album share key.");
 		}
 	}
 }
@@ -246,7 +280,7 @@ async function fetchAlbumAssets(creds: ImmichCredentials, album: Record<string, 
 
 	// The search API is paginated and reports the next page to request, if any.
 	while (page > 0) {
-		const result = await requestUrl({
+		const result = await immichRequest({
 			url: url.toString(),
 			method: 'POST',
 			headers: { ...apiHeaders(creds), 'Content-Type': 'application/json' },
@@ -256,10 +290,7 @@ async function fetchAlbumAssets(creds: ImmichCredentials, album: Record<string, 
 				page: page,
 				size: pageSize
 			})
-		});
-		if (result.status !== 200) {
-			throw new Error('Search API returned status ' + result.status);
-		}
+		}, 'listing the album\'s assets');
 
 		const searchAssets = result.json?.['assets'];
 		const items: ImmichAsset[] = searchAssets?.['items'] ?? [];
@@ -286,13 +317,10 @@ async function refreshCacheFromImmich(creds: ImmichCredentials, silent=true) {
 	}
 
 	const url = new URL(creds.immichUrl + '/api/albums/' + creds.immichAlbum);
-	const result = await requestUrl({
+	const result = await immichRequest({
 		url: url.toString(),
 		headers: apiHeaders(creds)
-	})
-	if (result.status !== 200) {
-		throw new Error('Album request returned status ' + result.status);
-	}
+	}, 'loading the album');
 
 	const album = result.json ?? {};
 	const assets = await fetchAlbumAssets(creds, album);
@@ -329,7 +357,7 @@ export default class ObsidianImmich extends Plugin {
 				new Notice('Refreshing immich cache.');
 				refreshCacheFromImmich(this.credentials(), false).catch((error) => {
 					console.error('[Immich] Failed to refresh album cache:', error);
-					new Notice('Failed to refresh the immich album cache - check the console for additional information.');
+					new Notice('Failed to refresh the immich album cache. ' + describeException(error));
 				});
 			}
 		});
@@ -431,7 +459,7 @@ class ImageSelectorModal extends Modal {
 			} catch (error) {
 				console.error('[Immich] Failed to load album:', error);
 				contentEl.createDiv({cls: 'obsidian-immich-empty'}).setText(
-					'Failed to load the immich album. Check your settings and the console for additional information.'
+					'Failed to load the immich album. ' + describeException(error)
 				);
 				return;
 			}
@@ -461,7 +489,7 @@ class ImageSelectorModal extends Modal {
 				this.onClose();
 				await this.onOpen();
 			} catch (error) {
-				new Notice('Failed to refresh cache');
+				new Notice('Failed to refresh cache. ' + describeException(error));
 				console.error('Refresh failed:', error);
 				refreshButton.disabled = false;
 				refreshButton.setText('\u21bb Refresh');
