@@ -51,6 +51,21 @@ function normalizeImmichUrl(value: string): string {
 	return value.trim().replace(/\/+$/, '');
 }
 
+// The setup instructions have the user copy a share URL and pick the key out of
+// it, so the whole URL routinely ends up stored instead. Immich then receives a
+// URL where it expects a token and answers 401, which is an unhelpful way to
+// find out. Accept either form.
+function normalizeAlbumShareKey(value: string): string {
+	let key = value.trim();
+	const marker = key.lastIndexOf('/share/');
+	if (marker !== -1) {
+		key = key.slice(marker + '/share/'.length);
+	}
+	// Drop anything after the key itself, plus any trailing separators.
+	key = key.split(/[?#]/)[0];
+	return key.replace(/\/+$/, '');
+}
+
 function resolveCredentials(app: App, settings: PluginSettings): ImmichCredentials {
 	const readSecret = (id: string): string => {
 		if (!id) return '';
@@ -59,8 +74,10 @@ function resolveCredentials(app: App, settings: PluginSettings): ImmichCredentia
 	return {
 		immichUrl: settings.immichUrl,
 		immichAlbum: settings.immichAlbum,
-		immichApiKey: readSecret(settings.immichApiKeySecret),
-		immichAlbumKey: readSecret(settings.immichAlbumKeySecret)
+		immichApiKey: readSecret(settings.immichApiKeySecret).trim(),
+		// Normalized on read rather than on input: the value lives in the
+		// keychain, which the user edits through Obsidian's own UI.
+		immichAlbumKey: normalizeAlbumShareKey(readSecret(settings.immichAlbumKeySecret))
 	};
 }
 
@@ -83,13 +100,24 @@ function apiHeaders(creds: ImmichCredentials): Record<string, string> {
 // moved album listing to the search API.
 const REQUIRED_PERMISSIONS = 'server.about, album.read, and asset.read';
 
-function describeHttpFailure(status: number, context: string): string {
+// Which credential a given request is authenticated by, so that a rejection can
+// point at the setting that actually needs fixing. Asset media is fetched with
+// the album share key; everything else uses the API key.
+type AuthKind = 'api-key' | 'share-key';
+
+function describeHttpFailure(status: number, context: string, auth: AuthKind): string {
 	switch (status) {
 		case 401:
-			return 'Immich rejected the API key (401) while ' + context + '. Check the API key in the plugin settings.';
+			return auth === 'share-key'
+				? 'Immich rejected the album share key (401) while ' + context + '. Check it in the plugin ' +
+					'settings - it should be only the key from the end of the share URL, not the whole URL.'
+				: 'Immich rejected the API key (401) while ' + context + '. Check the API key in the plugin settings.';
 		case 403:
-			return 'Immich denied access (403) while ' + context + '. The API key is most likely missing a ' +
-				'required permission - this plugin needs ' + REQUIRED_PERMISSIONS + '.';
+			return auth === 'share-key'
+				? 'Immich denied access (403) while ' + context + '. The album share link may have expired, or ' +
+					'the album share key may be wrong.'
+				: 'Immich denied access (403) while ' + context + '. The API key is most likely missing a ' +
+					'required permission - this plugin needs ' + REQUIRED_PERMISSIONS + '.';
 		case 404:
 			return 'Immich returned not found (404) while ' + context + '. Check the Immich URL and album ID.';
 		default:
@@ -100,10 +128,10 @@ function describeHttpFailure(status: number, context: string): string {
 // requestUrl throws its own opaque "Request failed, status NNN" for any 4xx/5xx,
 // which hides which permission or setting is actually at fault. Handle the
 // status directly so the failure can be explained in terms the user can act on.
-async function immichRequest(params: RequestUrlParam, context: string): Promise<RequestUrlResponse> {
+async function immichRequest(params: RequestUrlParam, context: string, auth: AuthKind = 'api-key'): Promise<RequestUrlResponse> {
 	const result = await requestUrl({ ...params, throw: false });
 	if (result.status < 200 || result.status >= 300) {
-		throw new Error(describeHttpFailure(result.status, context));
+		throw new Error(describeHttpFailure(result.status, context, auth));
 	}
 	return result;
 }
@@ -230,7 +258,7 @@ async function testConnection(creds: ImmichCredentials) {
 			const result = await immichRequest({
 				url: url3.toString(),
 				headers: apiHeaders(creds)
-			}, 'reading an asset thumbnail')
+			}, 'reading an asset thumbnail', 'share-key')
 			const duration = Date.now() - startTime;
 			
 			console.log('[Immich] Asset access response:', {
