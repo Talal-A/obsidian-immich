@@ -1,17 +1,37 @@
-import { App, Editor, Modal, Notice, Plugin, PluginSettingTab, RequestUrlResponse, Setting, requestUrl } from 'obsidian';
+import { App, Editor, Modal, Notice, Plugin, PluginSettingTab, RequestUrlResponse, SecretComponent, Setting, requestUrl } from 'obsidian';
 
 interface PluginSettings {
 	immichUrl: string;
-	immichApiKey: string;
 	immichAlbum: string;
-	immichAlbumKey: string;
+	// IDs of entries in Obsidian's keychain. The secret values themselves are
+	// never persisted here - only the name that points at them.
+	immichApiKeySecret: string;
+	immichAlbumKeySecret: string;
+	// Plaintext credentials written by versions before 0.4.0. These are only
+	// read so that they can be offered for migration into the keychain, and are
+	// cleared once the user accepts.
+	immichApiKey?: string;
+	immichAlbumKey?: string;
 }
 
 const DEFAULT_SETTINGS: PluginSettings = {
 	immichUrl: '',
-	immichApiKey: '',
 	immichAlbum: '',
-	immichAlbumKey: ''
+	immichApiKeySecret: '',
+	immichAlbumKeySecret: ''
+}
+
+const API_KEY_SECRET_ID = 'immich-api-key';
+const ALBUM_KEY_SECRET_ID = 'immich-album-share-key';
+
+// The credentials the plugin actually talks to Immich with, with the secrets
+// resolved out of the keychain. Deliberately kept separate from PluginSettings
+// so that secret values can never be handed to saveData().
+interface ImmichCredentials {
+	immichUrl: string;
+	immichAlbum: string;
+	immichApiKey: string;
+	immichAlbumKey: string;
 }
 
 interface ImmichAsset {
@@ -31,30 +51,61 @@ function normalizeImmichUrl(value: string): string {
 	return value.trim().replace(/\/+$/, '');
 }
 
-// Identifies the settings the cache was built from, so that changing the
-// instance/album/credentials invalidates it instead of showing stale assets.
-function settingsFingerprint(settings: PluginSettings): string {
-	return JSON.stringify([settings.immichUrl, settings.immichAlbum, settings.immichApiKey, settings.immichAlbumKey]);
-}
-
-function apiHeaders(settings: PluginSettings): Record<string, string> {
+function resolveCredentials(app: App, settings: PluginSettings): ImmichCredentials {
+	const readSecret = (id: string): string => {
+		if (!id) return '';
+		return app.secretStorage.getSecret(id) ?? '';
+	};
 	return {
-		'Accept': 'application/json',
-		'x-api-key': settings.immichApiKey.toString()
+		immichUrl: settings.immichUrl,
+		immichAlbum: settings.immichAlbum,
+		immichApiKey: readSecret(settings.immichApiKeySecret),
+		immichAlbumKey: readSecret(settings.immichAlbumKeySecret)
 	};
 }
 
-async function testConnection(settings: PluginSettings) {
-	const url = new URL(settings.immichUrl + '/api/server/about');
+// Identifies the credentials the cache was built from, so that changing the
+// instance/album - or rotating a secret in the keychain - invalidates it
+// instead of showing stale assets.
+function credentialsFingerprint(creds: ImmichCredentials): string {
+	return JSON.stringify([creds.immichUrl, creds.immichAlbum, creds.immichApiKey, creds.immichAlbumKey]);
+}
+
+function apiHeaders(creds: ImmichCredentials): Record<string, string> {
+	return {
+		'Accept': 'application/json',
+		'x-api-key': creds.immichApiKey
+	};
+}
+
+function hasLegacyPlaintextSecrets(settings: PluginSettings): boolean {
+	return !!(settings.immichApiKey || settings.immichAlbumKey);
+}
+
+// Secret IDs must be lowercase alphanumeric with optional dashes. Pick the
+// plain name when it is free, otherwise suffix it so that migrating never
+// overwrites a secret another plugin (or an earlier vault) already owns.
+function availableSecretId(app: App, preferredId: string): string {
+	const taken = new Set(app.secretStorage.listSecrets());
+	if (!taken.has(preferredId)) return preferredId;
+	for (let i = 2; i < 100; i++) {
+		const candidate = preferredId + '-' + i;
+		if (!taken.has(candidate)) return candidate;
+	}
+	throw new Error('Could not find an unused secret ID for ' + preferredId);
+}
+
+async function testConnection(creds: ImmichCredentials) {
+	const url = new URL(creds.immichUrl + '/api/server/about');
 	console.log('[Immich] Testing connection to:', url.toString());
-	console.log('[Immich] API key configured:', settings.immichApiKey ? '✓ (present)' : '✗ (missing)');
+	console.log('[Immich] API key configured:', creds.immichApiKey ? '✓ (present)' : '✗ (missing)');
 	
 	new Notice("Testing connection to " + url);
 	try {
 		const startTime = Date.now();
 		const result = await requestUrl({
 			url: url.toString(),
-			headers: apiHeaders(settings)
+			headers: apiHeaders(creds)
 		})
 		const duration = Date.now() - startTime;
 
@@ -77,20 +128,20 @@ async function testConnection(settings: PluginSettings) {
 			error: exception,
 			errorMessage: exception instanceof Error ? exception.message : String(exception),
 			settings: {
-				immichUrl: settings.immichUrl,
-				hasApiKey: !!settings.immichApiKey
+				immichUrl: creds.immichUrl,
+				hasApiKey: !!creds.immichApiKey
 			}
 		});
-		new Notice("Failed to connect to " + settings.immichUrl + " - check the console for additional information.")
+		new Notice("Failed to connect to " + creds.immichUrl + " - check the console for additional information.")
 	}	
-	const url2 = new URL(settings.immichUrl + '/api/albums/' + settings.immichAlbum);
+	const url2 = new URL(creds.immichUrl + '/api/albums/' + creds.immichAlbum);
 	console.log('[Immich] Testing album access with URL:', url2.toString());
 	let albumResult: RequestUrlResponse | null = null;
 	try {
 		const startTime = Date.now();
 		const result = await requestUrl({
 			url: url2.toString(),
-			headers: apiHeaders(settings)
+			headers: apiHeaders(creds)
 		})
 		const duration = Date.now() - startTime;
 		
@@ -114,9 +165,9 @@ async function testConnection(settings: PluginSettings) {
 			error: exception,
 			errorMessage: exception instanceof Error ? exception.message : String(exception),
 			settings: {
-				immichUrl: settings.immichUrl,
-				hasApiKey: !!settings.immichApiKey,
-				albumId: settings.immichAlbum
+				immichUrl: creds.immichUrl,
+				hasApiKey: !!creds.immichApiKey,
+				albumId: creds.immichAlbum
 			}
 		});
 		new Notice("Failed to access album - check the console for additional information.")
@@ -126,7 +177,7 @@ async function testConnection(settings: PluginSettings) {
 	let firstAsset: ImmichAsset | null = null;
 	if (albumResult) {
 		try {
-			const assets = await fetchAlbumAssets(settings, albumResult.json ?? {});
+			const assets = await fetchAlbumAssets(creds, albumResult.json ?? {});
 			firstAsset = assets[0] ?? null;
 			if (assets.length === 0) {
 				console.log('[Immich] Album contains no assets - skipping asset access test.');
@@ -138,13 +189,13 @@ async function testConnection(settings: PluginSettings) {
 	}
 	if (firstAsset) {
 		const assetId = firstAsset['id'];
-		const url3 = new URL(settings.immichUrl + '/api/assets/' + assetId + '/thumbnail?size=thumbnail&key=' + settings.immichAlbumKey);
+		const url3 = new URL(creds.immichUrl + '/api/assets/' + assetId + '/thumbnail?size=thumbnail&key=' + creds.immichAlbumKey);
 		console.log('[Immich] Testing asset access with URL:', url3.toString());
 		try {
 			const startTime = Date.now();
 			const result = await requestUrl({
 				url: url3.toString(),
-				headers: apiHeaders(settings)
+				headers: apiHeaders(creds)
 			})
 			const duration = Date.now() - startTime;
 			
@@ -167,10 +218,10 @@ async function testConnection(settings: PluginSettings) {
 				error: exception,
 				errorMessage: exception instanceof Error ? exception.message : String(exception),
 				settings: {
-					immichUrl: settings.immichUrl,
-					hasApiKey: !!settings.immichApiKey,
-					albumId: settings.immichAlbum,
-					albumKey: settings.immichAlbumKey
+					immichUrl: creds.immichUrl,
+					hasApiKey: !!creds.immichApiKey,
+					albumId: creds.immichAlbum,
+					albumKey: creds.immichAlbumKey
 				}
 			});
 			new Notice("Failed to access asset - check the console for additional information. This may indicate an issue with the album key.");
@@ -181,13 +232,13 @@ async function testConnection(settings: PluginSettings) {
 // Immich v3 removed the `assets` array from the album response, so the assets
 // have to be fetched separately via the search API. Older servers still inline
 // them, so use those when present to avoid an extra round trip.
-async function fetchAlbumAssets(settings: PluginSettings, album: Record<string, unknown>): Promise<ImmichAsset[]> {
+async function fetchAlbumAssets(creds: ImmichCredentials, album: Record<string, unknown>): Promise<ImmichAsset[]> {
 	const inlined = album['assets'];
 	if (Array.isArray(inlined)) {
 		return inlined as ImmichAsset[];
 	}
 
-	const url = new URL(settings.immichUrl + '/api/search/metadata');
+	const url = new URL(creds.immichUrl + '/api/search/metadata');
 	const order = album['order'] === 'asc' ? 'asc' : 'desc';
 	const pageSize = 1000; // Maximum permitted by the search API.
 	const assets: ImmichAsset[] = [];
@@ -198,9 +249,9 @@ async function fetchAlbumAssets(settings: PluginSettings, album: Record<string, 
 		const result = await requestUrl({
 			url: url.toString(),
 			method: 'POST',
-			headers: { ...apiHeaders(settings), 'Content-Type': 'application/json' },
+			headers: { ...apiHeaders(creds), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
-				albumIds: [settings.immichAlbum],
+				albumIds: [creds.immichAlbum],
 				order: order,
 				page: page,
 				size: pageSize
@@ -227,23 +278,29 @@ async function fetchAlbumAssets(settings: PluginSettings, album: Record<string, 
 	return assets;
 }
 
-async function refreshCacheFromImmich(settings: PluginSettings, silent=true) {
-	const url = new URL(settings.immichUrl + '/api/albums/' + settings.immichAlbum);
+async function refreshCacheFromImmich(creds: ImmichCredentials, silent=true) {
+	// A missing secret usually means the keychain entry was deleted or renamed,
+	// which is worth saying plainly rather than sending an unauthenticated call.
+	if (!creds.immichUrl || !creds.immichAlbum || !creds.immichApiKey) {
+		throw new Error('Immich URL, album ID, and API key must all be configured in the plugin settings.');
+	}
+
+	const url = new URL(creds.immichUrl + '/api/albums/' + creds.immichAlbum);
 	const result = await requestUrl({
 		url: url.toString(),
-		headers: apiHeaders(settings)
+		headers: apiHeaders(creds)
 	})
 	if (result.status !== 200) {
 		throw new Error('Album request returned status ' + result.status);
 	}
 
 	const album = result.json ?? {};
-	const assets = await fetchAlbumAssets(settings, album);
+	const assets = await fetchAlbumAssets(creds, album);
 
 	cachedResult = {
 		albumName: album['albumName'] ?? '',
 		assets: assets,
-		fingerprint: settingsFingerprint(settings)
+		fingerprint: credentialsFingerprint(creds)
 	};
 
 	if(!silent) {
@@ -261,16 +318,16 @@ export default class ObsidianImmich extends Plugin {
 			id: 'insert-from-album',
 			name: 'Insert from album',
 			editorCallback: (editor: Editor) => {
-				new ImageSelectorModal(this.app, editor, this.settings).open();
+				new ImageSelectorModal(this.app, editor, this.credentials()).open();
 			}
 		});
- 
+
 		this.addCommand({
 			id: 'force-refresh-album-cache',
 			name: 'Refresh album cache',
 			callback: () => {
 				new Notice('Refreshing immich cache.');
-				refreshCacheFromImmich(this.settings, false).catch((error) => {
+				refreshCacheFromImmich(this.credentials(), false).catch((error) => {
 					console.error('[Immich] Failed to refresh album cache:', error);
 					new Notice('Failed to refresh the immich album cache - check the console for additional information.');
 				});
@@ -279,9 +336,25 @@ export default class ObsidianImmich extends Plugin {
 
 		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new SettingTab(this.app, this));
+
+		// Nudge users upgrading from a version that kept credentials in
+		// data.json. The migration itself is not run without their say-so.
+		if (hasLegacyPlaintextSecrets(this.settings)) {
+			new Notice(
+				'Immich: your API key and album share key are still stored in plaintext. ' +
+				'Open the Immich plugin settings to move them into Obsidian\'s keychain.',
+				15000
+			);
+		}
 	}
 
 	onunload() {
+	}
+
+	// Resolved fresh on each use so that editing a secret in the keychain takes
+	// effect without reloading the plugin.
+	credentials(): ImmichCredentials {
+		return resolveCredentials(this.app, this.settings);
 	}
 
 	async loadSettings() {
@@ -292,11 +365,38 @@ export default class ObsidianImmich extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+
+	// Moves the pre-0.4.0 plaintext credentials into the keychain and removes
+	// them from data.json. Only invoked from the settings tab, on request.
+	async migrateLegacySecrets() {
+		const migrated: string[] = [];
+
+		if (this.settings.immichApiKey) {
+			const id = this.settings.immichApiKeySecret || availableSecretId(this.app, API_KEY_SECRET_ID);
+			this.app.secretStorage.setSecret(id, this.settings.immichApiKey);
+			this.settings.immichApiKeySecret = id;
+			migrated.push(id);
+		}
+		if (this.settings.immichAlbumKey) {
+			const id = this.settings.immichAlbumKeySecret || availableSecretId(this.app, ALBUM_KEY_SECRET_ID);
+			this.app.secretStorage.setSecret(id, this.settings.immichAlbumKey);
+			this.settings.immichAlbumKeySecret = id;
+			migrated.push(id);
+		}
+
+		// Only drop the plaintext copies once the keychain writes have gone
+		// through, so a failure above can never lose the user's credentials.
+		delete this.settings.immichApiKey;
+		delete this.settings.immichAlbumKey;
+		await this.saveSettings();
+
+		return migrated;
+	}
 }
 
 class ImageSelectorModal extends Modal {
 	editor: Editor;
-	settings: PluginSettings;
+	creds: ImmichCredentials;
 	currentPage: number;
 	batchSize: number;
 	loadedAssets: Map<number, HTMLElement>;
@@ -304,10 +404,10 @@ class ImageSelectorModal extends Modal {
 	isLoading: boolean;
 	scrollTimeout: number | null;
 
-	constructor(app: App, editor: Editor, settings: PluginSettings) {
+	constructor(app: App, editor: Editor, creds: ImmichCredentials) {
 		super(app);
 		this.editor = editor;
-		this.settings = settings;
+		this.creds = creds;
 		this.currentPage = 0;
 		this.batchSize = 6;
 		this.loadedAssets = new Map();
@@ -325,9 +425,9 @@ class ImageSelectorModal extends Modal {
 		this.isLoading = false;
 		this.loadedAssets.clear();
 
-		if (cachedResult == null || cachedResult.fingerprint !== settingsFingerprint(this.settings)) {
+		if (cachedResult == null || cachedResult.fingerprint !== credentialsFingerprint(this.creds)) {
 			try {
-				await refreshCacheFromImmich(this.settings);
+				await refreshCacheFromImmich(this.creds);
 			} catch (error) {
 				console.error('[Immich] Failed to load album:', error);
 				contentEl.createDiv({cls: 'obsidian-immich-empty'}).setText(
@@ -356,7 +456,7 @@ class ImageSelectorModal extends Modal {
 			refreshButton.disabled = true;
 			refreshButton.setText('Loading...');
 			try {
-				await refreshCacheFromImmich(this.settings, false);
+				await refreshCacheFromImmich(this.creds, false);
 				// Reload the modal
 				this.onClose();
 				await this.onOpen();
@@ -444,15 +544,15 @@ class ImageSelectorModal extends Modal {
 			if (this.loadedAssets.has(i)) continue;
 
 			const asset = assets[i];
-			const assetUrl = this.settings.immichUrl + '/api/assets/' + asset['id'];
-			const keyParam = '&key=' + this.settings.immichAlbumKey;
+			const assetUrl = this.creds.immichUrl + '/api/assets/' + asset['id'];
+			const keyParam = '&key=' + this.creds.immichAlbumKey;
 			const thumbUrl = assetUrl + '/thumbnail?size=thumbnail' + keyParam;
 
 			let insertionText: string;
 			if (asset['type'] === "IMAGE") {
 				insertionText = '![](' + assetUrl + '/thumbnail?size=preview' + keyParam + ')\n';
 			} else if (asset['type'] === "VIDEO") {
-				insertionText = '<video src="' + assetUrl + '/video/playback?key=' + this.settings.immichAlbumKey + '" controls></video>\n';
+				insertionText = '<video src="' + assetUrl + '/video/playback?key=' + this.creds.immichAlbumKey + '" controls></video>\n';
 			} else {
 				// Unknown asset type - nothing sensible to insert, so skip it
 				// rather than rendering a tile that inserts `undefined`.
@@ -513,6 +613,8 @@ class SettingTab extends PluginSettingTab {
 		const {containerEl} = this;
 		containerEl.empty();
 
+		this.displayMigrationNotice(containerEl);
+
 		new Setting(containerEl)
 			.setName('Immich URL')
 			.setDesc('Full URL to your immich instance.')
@@ -524,11 +626,11 @@ class SettingTab extends PluginSettingTab {
 				}));
 		new Setting(containerEl)
 			.setName('Immich API key')
-			.setDesc('Obtained from {IMMICH_URL}/user-settings?isOpen=api-keys.')
-			.addText(text => text
-				.setValue(this.plugin.settings.immichApiKey)
-				.onChange(async (value) => {
-					this.plugin.settings.immichApiKey = value;
+			.setDesc('Stored in Obsidian\'s keychain. Obtained from {IMMICH_URL}/user-settings?isOpen=api-keys.')
+			.addComponent(el => new SecretComponent(this.app, el)
+				.setValue(this.plugin.settings.immichApiKeySecret)
+				.onChange(async (secretId) => {
+					this.plugin.settings.immichApiKeySecret = secretId ?? '';
 					await this.plugin.saveSettings();
 				}));
 		new Setting(containerEl)
@@ -542,21 +644,56 @@ class SettingTab extends PluginSettingTab {
 				}));
 		new Setting(containerEl)
 			.setName('Immich album share key')
-			.setDesc('Share key which shows up in the URL of your album.')
-			.addText(text => text
-				.setValue(this.plugin.settings.immichAlbumKey)
-				.onChange(async (value) => {
-					this.plugin.settings.immichAlbumKey = value;
+			.setDesc('Stored in Obsidian\'s keychain. Share key which shows up in the URL of your album.')
+			.addComponent(el => new SecretComponent(this.app, el)
+				.setValue(this.plugin.settings.immichAlbumKeySecret)
+				.onChange(async (secretId) => {
+					this.plugin.settings.immichAlbumKeySecret = secretId ?? '';
 					await this.plugin.saveSettings();
 				}));
 		new Setting(containerEl)
 			.setName('Test connection')
 			.setDesc('Validate the connection between obsidian and your immich instance.')
-			.addButton(async (button) => {
+			.addButton((button) => {
 				button.setButtonText("Test connection")
 				button.onClick(async() => {
-					testConnection(this.plugin.settings)
+					testConnection(this.plugin.credentials())
 				})
 			})
+	}
+
+	// Shown only while pre-0.4.0 plaintext credentials are still in data.json.
+	// Migration is opt-in, so nothing moves until the button is pressed.
+	private displayMigrationNotice(containerEl: HTMLElement) {
+		if (!hasLegacyPlaintextSecrets(this.plugin.settings)) {
+			return;
+		}
+
+		const notice = containerEl.createDiv({cls: 'obsidian-immich-migration-notice'});
+		notice.createEl('p', {
+			text: 'Your Immich credentials are currently stored as plaintext in this vault\'s ' +
+				'data.json. Move them into Obsidian\'s keychain, where they are encrypted by ' +
+				'your operating system, and the plaintext copies will be removed.'
+		});
+
+		new Setting(notice)
+			.setName('Move credentials to the keychain')
+			.setDesc('Creates keychain entries for the credentials found in data.json.')
+			.addButton((button) => {
+				button.setCta();
+				button.setButtonText('Move to keychain');
+				button.onClick(async () => {
+					button.setDisabled(true);
+					try {
+						const migrated = await this.plugin.migrateLegacySecrets();
+						new Notice('Moved ' + migrated.length + ' credential(s) into the keychain: ' + migrated.join(', '));
+						this.display();
+					} catch (error) {
+						console.error('[Immich] Failed to migrate credentials:', error);
+						new Notice('Failed to move credentials into the keychain - check the console for additional information.');
+						button.setDisabled(false);
+					}
+				});
+			});
 	}
 }
