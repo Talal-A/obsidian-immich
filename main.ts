@@ -39,6 +39,30 @@ interface ImmichAsset {
 	type: string;
 }
 
+// Every field below comes off the wire, so a value that is not a string is a
+// server that does not match what this plugin expects. Coercing it with String()
+// would quietly produce "[object Object]" and put that in an asset URL.
+function asText(value: unknown): string {
+	if (typeof value === 'string') return value;
+	if (typeof value === 'number') return String(value);
+	return '';
+}
+
+// Narrows a JSON body to something indexable. requestUrl types `json` as `any`,
+// which spreads untyped values through everything that touches a response.
+function asObject(value: unknown): Record<string, unknown> {
+	return typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
+}
+
+// Immich returns a large asset object; keep only what the picker uses, since
+// the whole album is held in memory.
+function toImmichAsset(raw: Record<string, unknown>): ImmichAsset {
+	return {
+		id: asText(raw['id']),
+		type: asText(raw['type'])
+	};
+}
+
 interface AlbumCache {
 	albumName: string;
 	assets: ImmichAsset[];
@@ -219,13 +243,14 @@ async function testConnection(creds: ImmichCredentials) {
 	}
 
 	const url2 = new URL(creds.immichUrl + '/api/albums/' + creds.immichAlbum);
-	let albumResult: RequestUrlResponse | null = null;
+	let album: Record<string, unknown> | null = null;
 	try {
-		albumResult = await immichRequest({
+		const result = await immichRequest({
 			url: url2.toString(),
 			headers: apiHeaders(creds)
 		}, 'loading the album')
-		new Notice("Album access successful - found " + albumResult.json['assetCount'] + " assets.");
+		album = asObject(result.json);
+		new Notice("Album access successful - found " + asText(album['assetCount']) + " assets.");
 	} catch(exception) {
 		new Notice("Failed to access album. " + describeException(exception))
 	}
@@ -233,9 +258,9 @@ async function testConnection(creds: ImmichCredentials) {
 	// If there is an item in the album, also test access to the first asset to verify that the album key is correct.
 	// Immich v3 no longer inlines the assets in the album response, so look them up separately when needed.
 	let firstAsset: ImmichAsset | null = null;
-	if (albumResult) {
+	if (album) {
 		try {
-			const assets = await fetchAlbumAssets(creds, albumResult.json ?? {});
+			const assets = await fetchAlbumAssets(creds, album);
 			firstAsset = assets[0] ?? null;
 			if (assets.length === 0) {
 				new Notice("Album is empty - skipping the album share key check.");
@@ -266,7 +291,7 @@ async function testConnection(creds: ImmichCredentials) {
 async function fetchAlbumAssets(creds: ImmichCredentials, album: Record<string, unknown>): Promise<ImmichAsset[]> {
 	const inlined = album['assets'];
 	if (Array.isArray(inlined)) {
-		return inlined as ImmichAsset[];
+		return inlined.map(entry => toImmichAsset(asObject(entry)));
 	}
 
 	const url = new URL(creds.immichUrl + '/api/search/metadata');
@@ -289,11 +314,12 @@ async function fetchAlbumAssets(creds: ImmichCredentials, album: Record<string, 
 			})
 		}, 'listing the album\'s assets');
 
-		const searchAssets = result.json?.['assets'];
-		const items: ImmichAsset[] = searchAssets?.['items'] ?? [];
-		assets.push(...items);
+		const searchAssets = asObject(asObject(result.json)['assets']);
+		const rawItems = searchAssets['items'];
+		const items = Array.isArray(rawItems) ? rawItems : [];
+		assets.push(...items.map(entry => toImmichAsset(asObject(entry))));
 
-		const nextPage = Number(searchAssets?.['nextPage']);
+		const nextPage = Number(searchAssets['nextPage']);
 		page = Number.isFinite(nextPage) && nextPage > page ? nextPage : 0;
 
 		// Defensive stop: a server that keeps handing back a next page would
@@ -323,11 +349,11 @@ async function refreshCacheFromImmich(creds: ImmichCredentials, silent=true) {
 		headers: apiHeaders(creds)
 	}, 'loading the album');
 
-	const album = result.json ?? {};
+	const album = asObject(result.json);
 	const assets = await fetchAlbumAssets(creds, album);
 
 	cachedResult = {
-		albumName: album['albumName'] ?? '',
+		albumName: asText(album['albumName']),
 		assets: assets,
 		fingerprint: credentialsFingerprint(creds)
 	};
@@ -386,7 +412,7 @@ export default class ObsidianImmich extends Plugin {
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, asObject(await this.loadData()));
 		this.settings.immichUrl = normalizeImmichUrl(this.settings.immichUrl);
 	}
 
