@@ -13,6 +13,7 @@ Your API key and album share key are stored in Obsidian's keychain, which encryp
 - Browse a shared Immich album in a masonry grid that keeps each photo's own aspect ratio.
 - Filter instantly by filename, place, or date; press Enter to run Immich's smart (content-based) search against the album.
 - Select any number of photos or videos and insert them together, in the order you picked them.
+- Optionally **download a copy into the vault** instead of linking, so notes keep working if the Immich server goes away.
 
 ## Prerequisites 
 This assumes you have a working version of [immich](https://github.com/immich-app/immich) hosted. It does not necessarily need to be remotely accessible. This decision is left up to the reader.
@@ -77,6 +78,40 @@ In the picker:
 - **Enter** runs Immich's smart search, which matches on what a photo shows rather than what it is called - so "sunset over water" works even when nothing is named that. This requires machine learning to be enabled on your Immich server.
 - **Escape** clears the search; **Cmd/Ctrl+Enter** inserts the current selection.
 - Click a photo to select it, then press Insert. Photos are inserted in the order you selected them.
+
+### Downloading into the vault
+
+By default the plugin inserts a link back to Immich, which means the note breaks if the
+server is offline or the share link is revoked. Switch **Insert photos as** to "A copy
+downloaded into the vault" in the settings, or use the Link/Download toggle in the
+picker's footer to override it for a single insert.
+
+Files land in your configured attachment folder, named `immich-<id>-<original name>`.
+The id lets the plugin notice it has already downloaded a photo and link the existing
+copy rather than fetching it again.
+
+**Downloaded size** picks which rendition Immich serves:
+
+| Size | Notes |
+|---|---|
+| Original | As uploaded. Requires the share link to allow downloads. Often HEIC from phones. |
+| Large | Requires the share link to allow downloads. |
+| Medium | Default. Rendered by Immich, always displayable, ~1-2 MB. |
+| Small | Thumbnail-sized. |
+
+Medium and Small are rendered by Immich as JPEG or WebP, so they always display in
+Obsidian. **Originals from phones are usually HEIC, which Obsidian cannot show** - with
+"Fall back to a rendered image" on (the default), the plugin notices and downloads
+Immich's rendered version instead. With it off, the file is saved as-is and inserted as
+a link rather than a broken embed.
+
+**Shrink images after downloading** re-compresses images inside Obsidian to a maximum
+edge length and JPEG quality. This strips EXIF metadata, including dates and location -
+which also means that data does not end up in your vault. GIFs and SVGs are never
+re-encoded.
+
+Videos are never downloaded silently: if your selection includes any, the plugin asks
+whether to download or link them, since videos are large and cannot be shrunk.
 
 #### Refresh album cache
 The "Insert from album" command caches some information such as available images/videos, urls, and other metadata related to the album when it is first run. If you find that new images or changes are not showing up in the image selection modal, running this command will refresh the caches.

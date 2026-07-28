@@ -1,4 +1,10 @@
-import { App, Editor, Modal, Notice, Plugin, PluginSettingTab, RequestUrlParam, RequestUrlResponse, SecretComponent, Setting, requestUrl } from 'obsidian';
+import { App, Editor, MarkdownFileInfo, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, RequestUrlParam, RequestUrlResponse, SecretComponent, Setting, TFile, normalizePath, requestUrl } from 'obsidian';
+
+// Whether an insert links back to Immich or saves a copy into the vault.
+type InsertMode = 'link' | 'download';
+// The renditions Immich can serve. Everything except 'original' is transcoded
+// server-side to a format Obsidian can display.
+type RenditionSize = 'original' | 'fullsize' | 'preview' | 'thumbnail';
 
 interface PluginSettings {
 	immichUrl: string;
@@ -12,13 +18,36 @@ interface PluginSettings {
 	// cleared once the user accepts.
 	immichApiKey?: string;
 	immichAlbumKey?: string;
+
+	insertMode: InsertMode;
+	downloadSize: RenditionSize;
+	reencode: boolean;
+	maxEdge: number;
+	jpegQuality: number;
+	reuseExistingDownloads: boolean;
+	renditionFallback: boolean;
 }
 
 const DEFAULT_SETTINGS: PluginSettings = {
 	immichUrl: '',
 	immichAlbum: '',
 	immichApiKeySecret: '',
-	immichAlbumKeySecret: ''
+	immichAlbumKeySecret: '',
+	// Linking is the pre-0.7.0 behaviour, so upgrades change nothing until asked.
+	insertMode: 'link',
+	// 'preview' rather than 'original': Immich transcodes it, so it is always
+	// something Obsidian can render. See isRenderable().
+	downloadSize: 'preview',
+	reencode: false,
+	maxEdge: 2048,
+	jpegQuality: 0.85,
+	reuseExistingDownloads: true,
+	renditionFallback: true
+}
+
+function clamp(value: number, min: number, max: number, fallback: number): number {
+	if (!Number.isFinite(value)) return fallback;
+	return Math.min(max, Math.max(min, value));
 }
 
 const API_KEY_SECRET_ID = 'immich-api-key';
@@ -46,6 +75,8 @@ interface ImmichAsset {
 	// reserve the right shape before the thumbnail loads.
 	width: number;
 	height: number;
+	// Only consulted when naming a downloaded original; Immich marks it optional.
+	mimeType: string;
 }
 
 // Immich returns a large asset object; keep only what the picker displays or
@@ -60,7 +91,8 @@ function toImmichAsset(raw: Record<string, unknown>): ImmichAsset {
 		taken: String(raw['localDateTime'] ?? raw['fileCreatedAt'] ?? ''),
 		place: place,
 		width: Number(raw['width'] ?? exif['exifImageWidth'] ?? 0) || 0,
-		height: Number(raw['height'] ?? exif['exifImageHeight'] ?? 0) || 0
+		height: Number(raw['height'] ?? exif['exifImageHeight'] ?? 0) || 0,
+		mimeType: String(raw['originalMimeType'] ?? '')
 	};
 }
 
@@ -140,16 +172,28 @@ const REQUIRED_PERMISSIONS = 'server.about, album.read, and asset.read';
 // Which credential a given request is authenticated by, so that a rejection can
 // point at the setting that actually needs fixing. Asset media is fetched with
 // the album share key; everything else uses the API key.
-type AuthKind = 'api-key' | 'share-key';
+type AuthKind = 'api-key' | 'share-key' | 'share-key-download';
+
+// Downloading an original is gated by the share link's download permission,
+// which is a different switch from the one that lets thumbnails be viewed.
+const SHARE_DOWNLOAD_HINT = 'Downloading full-size assets requires the album share link to have ' +
+	'"Allow public user to download" enabled in Immich. Alternatively set the downloaded size to ' +
+	'Medium in the plugin settings, which does not need it.';
 
 function describeHttpFailure(status: number, context: string, auth: AuthKind): string {
 	switch (status) {
 		case 401:
+			if (auth === 'share-key-download') {
+				return 'Immich rejected the request (401) while ' + context + '. ' + SHARE_DOWNLOAD_HINT;
+			}
 			return auth === 'share-key'
 				? 'Immich rejected the album share key (401) while ' + context + '. Check it in the plugin ' +
 					'settings - it should be only the key from the end of the share URL, not the whole URL.'
 				: 'Immich rejected the API key (401) while ' + context + '. Check the API key in the plugin settings.';
 		case 403:
+			if (auth === 'share-key-download') {
+				return 'Immich denied access (403) while ' + context + '. ' + SHARE_DOWNLOAD_HINT;
+			}
 			return auth === 'share-key'
 				? 'Immich denied access (403) while ' + context + '. The album share link may have expired, or ' +
 					'the album share key may be wrong.'
@@ -445,8 +489,11 @@ export default class ObsidianImmich extends Plugin {
 		this.addCommand({
 			id: 'insert-from-album',
 			name: 'Insert from album',
-			editorCallback: (editor: Editor) => {
-				new ImageSelectorModal(this.app, editor, this.credentials()).open();
+			// The source note's path drives Obsidian's per-folder attachment
+			// settings and the relative links generated for downloaded files.
+			editorCallback: (editor: Editor, ctx: MarkdownView | MarkdownFileInfo) => {
+				const sourcePath = ctx?.file?.path ?? '';
+				new ImageSelectorModal(this.app, editor, sourcePath, this.credentials(), this.settings).open();
 			}
 		});
 
@@ -488,6 +535,10 @@ export default class ObsidianImmich extends Plugin {
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 		this.settings.immichUrl = normalizeImmichUrl(this.settings.immichUrl);
+		// data.json is user-editable, so the numeric settings are re-clamped
+		// rather than trusted.
+		this.settings.maxEdge = clamp(Number(this.settings.maxEdge), 256, 8192, DEFAULT_SETTINGS.maxEdge);
+		this.settings.jpegQuality = clamp(Number(this.settings.jpegQuality), 0.3, 1, DEFAULT_SETTINGS.jpegQuality);
 	}
 
 	async saveSettings() {
@@ -522,6 +573,541 @@ export default class ObsidianImmich extends Plugin {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Downloading assets into the vault
+// ---------------------------------------------------------------------------
+
+// requestUrl does not guarantee header name casing across platforms.
+function headerValue(headers: Record<string, string>, name: string): string {
+	const wanted = name.toLowerCase();
+	for (const key of Object.keys(headers ?? {})) {
+		if (key.toLowerCase() === wanted) return headers[key] ?? '';
+	}
+	return '';
+}
+
+const MIME_EXTENSIONS: Record<string, string> = {
+	'image/jpeg': 'jpg',
+	'image/jpg': 'jpg',
+	'image/png': 'png',
+	'image/webp': 'webp',
+	'image/avif': 'avif',
+	'image/gif': 'gif',
+	'image/bmp': 'bmp',
+	'image/svg+xml': 'svg',
+	'image/heic': 'heic',
+	'image/heif': 'heif',
+	'image/tiff': 'tiff',
+	'video/mp4': 'mp4',
+	'video/webm': 'webm',
+	'video/quicktime': 'mov',
+	'video/x-matroska': 'mkv'
+};
+
+// What Obsidian will actually render in a note. Anything else embeds as a
+// broken image box, so it gets linked rather than embedded.
+const RENDERABLE_IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'svg', 'webp', 'avif']);
+const RENDERABLE_VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'ogv', 'mov', 'mkv']);
+
+// Re-encoding these is a downgrade rather than a saving: it would flatten an
+// animation, or rasterise a vector.
+const NEVER_REENCODE = new Set(['gif', 'svg']);
+
+function splitFileName(name: string): {stem: string, ext: string} {
+	const clean = (name ?? '').trim();
+	const dot = clean.lastIndexOf('.');
+	if (dot <= 0 || dot === clean.length - 1) return {stem: clean, ext: ''};
+	return {stem: clean.slice(0, dot), ext: clean.slice(dot + 1).toLowerCase()};
+}
+
+function sanitizeFileStem(stem: string): string {
+	const cleaned = (stem || 'photo')
+		// Characters that are illegal in a filename on some platform, or that
+		// would confuse Obsidian's own link parser.
+		.replace(/[\\/:*?"<>|#^[\]]/g, '')
+		// eslint-disable-next-line no-control-regex
+		.replace(/[\u0000-\u001f]/g, '')
+		.replace(/\s+/g, ' ')
+		.trim();
+	return (cleaned || 'photo').slice(0, 48);
+}
+
+function mimeExtension(contentType: string): string {
+	const base = (contentType || '').split(';')[0].trim().toLowerCase();
+	return MIME_EXTENSIONS[base] ?? '';
+}
+
+// A rendition's format is whatever the server chose, so the response wins. An
+// original's format is whatever was uploaded, and the filename is the most
+// reliable record of that - the body is served as octet-stream either way.
+function extensionForDownload(asset: ImmichAsset, contentType: string, size: RenditionSize): string {
+	if (asset.type === 'VIDEO') {
+		return mimeExtension(contentType) || splitFileName(asset.fileName).ext || 'mp4';
+	}
+	if (size !== 'original') {
+		return mimeExtension(contentType) || 'jpg';
+	}
+
+	const named = splitFileName(asset.fileName).ext;
+	if (/^[a-z0-9]{1,5}$/.test(named)) return named;
+
+	const fromAsset = mimeExtension(asset.mimeType);
+	if (fromAsset) return fromAsset;
+
+	const fromResponse = mimeExtension(contentType);
+	if (fromResponse) return fromResponse;
+
+	// Last resort: derive something from the subtype, e.g. image/x-canon-cr2.
+	const subtype = (contentType || '').split(';')[0].split('/')[1] ?? '';
+	const guess = subtype.replace(/^x-/, '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+	return guess ? guess.slice(0, 5) : 'bin';
+}
+
+function isRenderable(asset: ImmichAsset, ext: string): boolean {
+	return asset.type === 'VIDEO'
+		? RENDERABLE_VIDEO_EXTENSIONS.has(ext)
+		: RENDERABLE_IMAGE_EXTENSIONS.has(ext);
+}
+
+// The asset id is embedded so that a later insert of the same photo can find
+// the existing copy without the plugin having to persist any index.
+function downloadFileName(asset: ImmichAsset, ext: string): string {
+	const stem = sanitizeFileStem(splitFileName(asset.fileName).stem);
+	return 'immich-' + asset.id.slice(0, 8) + '-' + stem + '.' + ext;
+}
+
+function assetMediaUrl(creds: ImmichCredentials, asset: ImmichAsset, size: RenditionSize): string {
+	const base = creds.immichUrl + '/api/assets/' + asset.id;
+	const key = encodeURIComponent(creds.immichAlbumKey);
+	if (asset.type === 'VIDEO') {
+		return base + '/video/playback?key=' + key;
+	}
+	if (size === 'original') {
+		return base + '/original?key=' + key;
+	}
+	return base + '/thumbnail?size=' + size + '&key=' + key;
+}
+
+// 'original' and 'fullsize' both end up at the download endpoint, which the
+// share link may not permit even when viewing thumbnails works.
+function authKindForSize(size: RenditionSize): AuthKind {
+	return size === 'original' || size === 'fullsize' ? 'share-key-download' : 'share-key';
+}
+
+interface FetchedAsset {
+	data: ArrayBuffer;
+	contentType: string;
+	sizeUsed: RenditionSize;
+}
+
+async function fetchAssetBytes(creds: ImmichCredentials, asset: ImmichAsset, size: RenditionSize): Promise<FetchedAsset> {
+	const attempt = async (which: RenditionSize): Promise<FetchedAsset> => {
+		const result = await immichRequest({
+			url: assetMediaUrl(creds, asset, which),
+			headers: apiHeaders(creds)
+		}, 'downloading ' + (asset.fileName || 'an asset'), authKindForSize(which));
+		return {
+			data: result.arrayBuffer,
+			contentType: headerValue(result.headers, 'content-type'),
+			sizeUsed: which
+		};
+	};
+
+	try {
+		return await attempt(size);
+	} catch (error) {
+		// A share link without download permission can serve previews but not
+		// originals, so fall back rather than failing the whole import.
+		const denied = /\(40[13]\)/.test(describeException(error));
+		if (denied && asset.type !== 'VIDEO' && (size === 'original' || size === 'fullsize')) {
+			return await attempt('preview');
+		}
+		throw error;
+	}
+}
+
+// ---- client-side re-encode ------------------------------------------------
+
+function scaledDimensions(width: number, height: number, maxEdge: number): {width: number, height: number} {
+	const longest = Math.max(width, height);
+	if (maxEdge <= 0 || longest <= maxEdge) return {width, height};
+	const scale = maxEdge / longest;
+	return {
+		width: Math.max(1, Math.round(width * scale)),
+		height: Math.max(1, Math.round(height * scale))
+	};
+}
+
+function canvasToArrayBuffer(canvas: HTMLCanvasElement, quality: number): Promise<ArrayBuffer | null> {
+	return new Promise(resolve => {
+		canvas.toBlob(blob => {
+			if (!blob) {
+				resolve(null);
+				return;
+			}
+			blob.arrayBuffer().then(resolve).catch(() => resolve(null));
+		}, 'image/jpeg', quality);
+	});
+}
+
+// Returns null whenever re-encoding is impossible or pointless, in which case
+// the caller keeps the bytes it already has. HEIC lands here: the browser
+// cannot decode it, so this is not the place that rescues it - see the
+// rendition fallback in AssetImporter.
+async function reencodeImage(
+	data: ArrayBuffer, contentType: string, ext: string, maxEdge: number, quality: number
+): Promise<{data: ArrayBuffer, ext: string} | null> {
+	if (NEVER_REENCODE.has(ext)) return null;
+
+	let bitmap: ImageBitmap | null = null;
+	try {
+		const blob = new Blob([data], {type: contentType || 'image/jpeg'});
+		// Bake in the EXIF rotation: re-encoding drops the metadata, so an
+		// unrotated bitmap would be permanently sideways.
+		// Cast: 'from-image' postdates the DOM lib this project compiles against,
+		// but it is what Chromium implements and what Obsidian runs on.
+		bitmap = await createImageBitmap(blob, {imageOrientation: 'from-image'} as unknown as ImageBitmapOptions);
+
+		const target = scaledDimensions(bitmap.width, bitmap.height, maxEdge);
+		// Nothing to shrink and nothing to squeeze - leave the original alone.
+		if (target.width === bitmap.width && target.height === bitmap.height && quality >= 1) {
+			return null;
+		}
+
+		const canvas = document.createElement('canvas');
+		canvas.width = target.width;
+		canvas.height = target.height;
+		const ctx = canvas.getContext('2d');
+		if (!ctx) return null;
+		ctx.drawImage(bitmap, 0, 0, target.width, target.height);
+
+		const encoded = await canvasToArrayBuffer(canvas, quality);
+		return encoded ? {data: encoded, ext: 'jpg'} : null;
+	} catch (error) {
+		console.warn('[Immich] Could not re-encode image, keeping the original bytes:', error);
+		return null;
+	} finally {
+		// Large bitmaps are held outside the JS heap; twenty of them will
+		// exhaust a phone before the collector notices.
+		bitmap?.close?.();
+	}
+}
+
+// ---- writing into the vault ----------------------------------------------
+
+interface AttachmentTarget {
+	path: string;
+	existing: TFile | null;
+}
+
+// getAvailablePathForAttachment resolves the user's attachment folder, creates
+// it, and dedupes the name. A deduped name means a file of the desired name is
+// already there - and since the name carries the asset id, that file is this
+// asset.
+async function resolveAttachmentTarget(
+	app: App, desiredName: string, sourcePath: string, reuse: boolean
+): Promise<AttachmentTarget> {
+	const available = normalizePath(await app.fileManager.getAvailablePathForAttachment(desiredName, sourcePath));
+	const slash = available.lastIndexOf('/');
+	const dir = slash === -1 ? '' : available.slice(0, slash);
+	const chosenName = slash === -1 ? available : available.slice(slash + 1);
+
+	// With reuse off, always take the deduped path Obsidian offered rather than
+	// adopting the file that is already there.
+	if (!reuse || chosenName === desiredName) {
+		return {path: available, existing: null};
+	}
+
+	const desiredPath = normalizePath(dir ? dir + '/' + desiredName : desiredName);
+	const existing = app.vault.getFileByPath(desiredPath);
+	return existing ? {path: desiredPath, existing} : {path: available, existing: null};
+}
+
+async function writeAttachment(app: App, path: string, data: ArrayBuffer): Promise<TFile> {
+	try {
+		return await app.vault.createBinary(path, data);
+	} catch (error) {
+		// Recovery only. The adapter bypasses the vault index, so a file written
+		// this way may not be linkable until the index catches up.
+		console.warn('[Immich] createBinary failed, falling back to the adapter:', error);
+		await app.vault.adapter.writeBinary(normalizePath(path), data);
+		const file = app.vault.getFileByPath(path);
+		if (file) return file;
+		await new Promise(resolve => window.setTimeout(resolve, 50));
+		const retried = app.vault.getFileByPath(path);
+		if (retried) return retried;
+		throw error;
+	}
+}
+
+function embedMarkdown(app: App, file: TFile, sourcePath: string, embed: boolean): string {
+	// generateMarkdownLink honours the user's wikilink/markdown and relative
+	// path preferences; it has no embed flag, hence the manual '!'.
+	const link = app.fileManager.generateMarkdownLink(file, sourcePath);
+	return (embed ? '!' : '') + link + '\n';
+}
+
+// ---- the importer ---------------------------------------------------------
+
+interface ImportOptions {
+	size: RenditionSize;
+	reencode: boolean;
+	maxEdge: number;
+	quality: number;
+	reuseExisting: boolean;
+	renditionFallback: boolean;
+	downloadVideos: boolean;
+}
+
+interface ImportProgress {
+	index: number;
+	total: number;
+	asset: ImmichAsset;
+}
+
+interface ImportResult {
+	markdown: string;
+	failed: number;
+	downloaded: number;
+	reused: number;
+	cancelled: boolean;
+	notes: string[];
+}
+
+// Stop trying after this many failures in a row: a wrong share key or a missing
+// permission fails every asset, and there is no sense working through twenty of
+// them to discover that.
+const CONSECUTIVE_FAILURE_LIMIT = 3;
+
+class AssetImporter {
+	private app: App;
+	private creds: ImmichCredentials;
+	private sourcePath: string;
+	private options: ImportOptions;
+	private done = new Map<string, {file: TFile, embed: boolean}>();
+	private cancelled = false;
+
+	private firstError = '';
+	private downgraded = 0;
+	private fellBackToRendition = 0;
+	private savedUnrenderable = 0;
+
+	constructor(app: App, creds: ImmichCredentials, sourcePath: string, options: ImportOptions) {
+		this.app = app;
+		this.creds = creds;
+		this.sourcePath = sourcePath;
+		this.options = options;
+	}
+
+	cancel() {
+		this.cancelled = true;
+	}
+
+	// Predicts the saved name without a request, so an asset already in the
+	// vault can be reused before anything is downloaded. A wrong guess only
+	// costs a download that would otherwise have been skipped.
+	private predictedFileName(asset: ImmichAsset): string {
+		const ext = this.options.size === 'original'
+			? (splitFileName(asset.fileName).ext || 'jpg')
+			: (asset.type === 'VIDEO' ? 'mp4' : 'jpg');
+		return downloadFileName(asset, ext);
+	}
+
+	private async importOne(asset: ImmichAsset): Promise<string> {
+		const cached = this.done.get(asset.id);
+		if (cached) {
+			return embedMarkdown(this.app, cached.file, this.sourcePath, cached.embed);
+		}
+
+		if (this.options.reuseExisting) {
+			const probe = await resolveAttachmentTarget(this.app, this.predictedFileName(asset), this.sourcePath, true);
+			if (probe.existing) {
+				const embed = isRenderable(asset, splitFileName(probe.existing.name).ext);
+				this.done.set(asset.id, {file: probe.existing, embed});
+				return embedMarkdown(this.app, probe.existing, this.sourcePath, embed);
+			}
+		}
+
+		let fetched = await fetchAssetBytes(this.creds, asset, this.options.size);
+		if (fetched.sizeUsed !== this.options.size) this.downgraded++;
+
+		let ext = extensionForDownload(asset, fetched.contentType, fetched.sizeUsed);
+
+		// HEIC and camera RAW cannot be shown by Obsidian, and cannot be decoded
+		// by the browser either - but Immich will transcode them for us.
+		if (!isRenderable(asset, ext) && asset.type !== 'VIDEO' && this.options.renditionFallback
+			&& fetched.sizeUsed === 'original') {
+			try {
+				fetched = await fetchAssetBytes(this.creds, asset, 'fullsize');
+				ext = extensionForDownload(asset, fetched.contentType, fetched.sizeUsed);
+				this.fellBackToRendition++;
+			} catch (error) {
+				console.warn('[Immich] Could not fetch a displayable rendition:', error);
+			}
+		}
+
+		let data = fetched.data;
+		if (this.options.reencode && asset.type !== 'VIDEO' && isRenderable(asset, ext)) {
+			const reencoded = await reencodeImage(
+				data, fetched.contentType, ext, this.options.maxEdge, this.options.quality
+			);
+			if (reencoded) {
+				data = reencoded.data;
+				ext = reencoded.ext;
+			}
+		}
+
+		const embed = isRenderable(asset, ext);
+		if (!embed) this.savedUnrenderable++;
+
+		const target = await resolveAttachmentTarget(
+			this.app, downloadFileName(asset, ext), this.sourcePath, this.options.reuseExisting
+		);
+		const file = target.existing ?? await writeAttachment(this.app, target.path, data);
+		this.done.set(asset.id, {file, embed});
+		return embedMarkdown(this.app, file, this.sourcePath, embed);
+	}
+
+	async importAll(
+		assets: ImmichAsset[],
+		onProgress: (progress: ImportProgress) => void,
+		linkTextFor: (asset: ImmichAsset) => string
+	): Promise<ImportResult> {
+		const parts: string[] = [];
+		let failed = 0;
+		let downloaded = 0;
+		let reused = 0;
+		let consecutive = 0;
+		let givenUp = false;
+
+		for (let i = 0; i < assets.length; i++) {
+			if (this.cancelled) {
+				return {markdown: '', failed, downloaded, reused, cancelled: true, notes: []};
+			}
+
+			const asset = assets[i];
+			onProgress({index: i + 1, total: assets.length, asset});
+
+			// Videos are linked unless the user opted in; they are far larger
+			// than photos and cannot be shrunk client-side.
+			if (asset.type === 'VIDEO' && !this.options.downloadVideos) {
+				parts.push(linkTextFor(asset));
+				continue;
+			}
+			if (givenUp) {
+				parts.push(linkTextFor(asset));
+				continue;
+			}
+
+			try {
+				const before = this.done.size;
+				parts.push(await this.importOne(asset));
+				if (this.done.size > before) downloaded++; else reused++;
+				consecutive = 0;
+			} catch (error) {
+				console.error('[Immich] Failed to download ' + asset.fileName + ':', error);
+				// Without the underlying reason the summary is unactionable.
+				if (!this.firstError) this.firstError = describeException(error);
+				// A working hot link in the right position beats a gap.
+				parts.push(linkTextFor(asset));
+				failed++;
+				consecutive++;
+				if (consecutive >= CONSECUTIVE_FAILURE_LIMIT) {
+					givenUp = true;
+					console.warn('[Immich] Too many consecutive download failures; linking the rest.');
+				}
+			}
+		}
+
+		const notes: string[] = [];
+		if (failed > 0) {
+			notes.push(failed + (failed === 1 ? ' item' : ' items') + ' could not be downloaded and ' +
+				(failed === 1 ? 'was' : 'were') + ' inserted as links.');
+		}
+		if (this.firstError) notes.push('First failure: ' + this.firstError);
+		if (this.downgraded > 0) {
+			notes.push(this.downgraded + ' could not be fetched at the requested size and used the medium rendition.');
+		}
+		if (this.fellBackToRendition > 0) {
+			notes.push(this.fellBackToRendition + ' original' + (this.fellBackToRendition === 1 ? '' : 's') +
+				' could not be displayed by Obsidian and ' + (this.fellBackToRendition === 1 ? 'was' : 'were') +
+				' saved as a rendered image instead.');
+		}
+		if (this.savedUnrenderable > 0) {
+			notes.push(this.savedUnrenderable + ' file' + (this.savedUnrenderable === 1 ? '' : 's') +
+				' cannot be displayed by Obsidian and ' + (this.savedUnrenderable === 1 ? 'was' : 'were') +
+				' inserted as a link rather than an embed.');
+		}
+
+		return {markdown: parts.join(''), failed, downloaded, reused, cancelled: false, notes};
+	}
+}
+
+// ---- the video prompt -----------------------------------------------------
+
+type VideoChoice = 'download' | 'link' | 'cancel';
+
+// Hand-rolled rather than ConfirmationModal, which needs Obsidian 1.13 while
+// this plugin supports 1.11.4.
+class VideoPromptModal extends Modal {
+	private count: number;
+	private resolve: (choice: VideoChoice) => void;
+	private settled = false;
+
+	constructor(app: App, count: number, resolve: (choice: VideoChoice) => void) {
+		super(app);
+		this.count = count;
+		this.resolve = resolve;
+	}
+
+	private settle(choice: VideoChoice) {
+		if (this.settled) return;
+		this.settled = true;
+		this.resolve(choice);
+	}
+
+	onOpen() {
+		const {contentEl, titleEl} = this;
+		titleEl.setText('Download videos too?');
+		contentEl.createEl('p', {
+			text: 'Your selection includes ' + this.count + (this.count === 1 ? ' video' : ' videos') +
+				'. Videos are saved at full size and can be very large - they cannot be shrunk the way ' +
+				'photos can. Photos in this selection will be downloaded either way.'
+		});
+
+		new Setting(contentEl)
+			.addButton(button => button
+				.setButtonText('Link videos')
+				.onClick(() => {
+					this.settle('link');
+					this.close();
+				}))
+			.addButton(button => button
+				.setCta()
+				.setButtonText('Download videos')
+				.onClick(() => {
+					this.settle('download');
+					this.close();
+				}))
+			.addButton(button => button
+				.setButtonText('Cancel')
+				.onClick(() => {
+					this.settle('cancel');
+					this.close();
+				}));
+	}
+
+	onClose() {
+		// Covers Escape and clicking outside, so the promise always resolves.
+		this.settle('cancel');
+		this.contentEl.empty();
+	}
+}
+
+function askAboutVideos(app: App, count: number): Promise<VideoChoice> {
+	return new Promise(resolve => new VideoPromptModal(app, count, resolve).open());
+}
+
 type TypeFilter = 'ALL' | 'IMAGE' | 'VIDEO';
 
 // How many tiles to append per chunk. The grid renders incrementally so that a
@@ -533,6 +1119,8 @@ const RENDER_CHUNK = 60;
 class ImageSelectorModal extends Modal {
 	editor: Editor;
 	creds: ImmichCredentials;
+	sourcePath: string;
+	settings: PluginSettings;
 
 	private assets: ImmichAsset[] = [];
 	private visible: ImmichAsset[] = [];
@@ -555,11 +1143,19 @@ class ImageSelectorModal extends Modal {
 	private searchEl: HTMLInputElement | null = null;
 	private observer: IntersectionObserver | null = null;
 	private searchDebounce: number | null = null;
+	private modeEl: HTMLElement | null = null;
+	private cancelButtonEl: HTMLButtonElement | null = null;
+	// Per-insert override of settings.insertMode; deliberately not persisted.
+	private insertMode: InsertMode = 'link';
+	private importer: AssetImporter | null = null;
+	private importing = false;
 
-	constructor(app: App, editor: Editor, creds: ImmichCredentials) {
+	constructor(app: App, editor: Editor, sourcePath: string, creds: ImmichCredentials, settings: PluginSettings) {
 		super(app);
 		this.editor = editor;
+		this.sourcePath = sourcePath;
 		this.creds = creds;
+		this.settings = settings;
 	}
 
 	async onOpen() {
@@ -587,7 +1183,7 @@ class ImageSelectorModal extends Modal {
 		if (cache == null) return;
 		// Drop anything the picker could not insert anyway, so that every count
 		// it reports matches the number of tiles actually on screen.
-		this.assets = cache.assets.filter(asset => this.insertionTextFor(asset) !== null);
+		this.assets = cache.assets.filter(asset => this.isInsertable(asset));
 
 		this.buildHeader(contentEl, cache.albumName);
 
@@ -613,6 +1209,9 @@ class ImageSelectorModal extends Modal {
 		this.smartResults = null;
 		this.smartQuery = '';
 		this.searching = false;
+		this.insertMode = this.settings.insertMode;
+		this.importing = false;
+		this.importer = null;
 	}
 
 	private buildHeader(parent: HTMLElement, albumName: string) {
@@ -724,9 +1323,40 @@ class ImageSelectorModal extends Modal {
 	private buildFooter(parent: HTMLElement) {
 		const footer = parent.createDiv({cls: 'obsidian-immich-footer'});
 
+		// Per-insert override of the configured default, so one photo can be
+		// downloaded without a trip to settings.
+		this.modeEl = footer.createDiv({cls: 'obsidian-immich-mode'});
+		const modes: Array<{key: InsertMode, label: string, hint: string}> = [
+			{key: 'link', label: 'Link', hint: 'Insert a link to Immich - needs the server to stay online'},
+			{key: 'download', label: 'Download', hint: 'Save a copy into the vault'}
+		];
+		for (const mode of modes) {
+			const button = this.modeEl.createEl('button', {cls: 'obsidian-immich-mode-option'});
+			button.setText(mode.label);
+			button.setAttribute('aria-label', mode.hint);
+			button.toggleClass('is-active', this.insertMode === mode.key);
+			button.setAttribute('aria-pressed', String(this.insertMode === mode.key));
+			button.onclick = () => {
+				if (this.importing) return;
+				this.insertMode = mode.key;
+				this.modeEl?.findAll('.obsidian-immich-mode-option').forEach(el => {
+					el.removeClass('is-active');
+					el.setAttribute('aria-pressed', 'false');
+				});
+				button.addClass('is-active');
+				button.setAttribute('aria-pressed', 'true');
+				this.updateStatus();
+			};
+		}
+
+		this.cancelButtonEl = footer.createEl('button', {cls: 'obsidian-immich-cancel'});
+		this.cancelButtonEl.setText('Cancel');
+		this.cancelButtonEl.onclick = () => this.importer?.cancel();
+
 		const clear = footer.createEl('button', {cls: 'obsidian-immich-clear'});
 		clear.setText('Clear selection');
 		clear.onclick = () => {
+			if (this.importing) return;
 			this.selection = [];
 			this.gridEl?.findAll('.obsidian-immich-tile').forEach(el => el.removeClass('is-selected'));
 			this.updateStatus();
@@ -734,6 +1364,21 @@ class ImageSelectorModal extends Modal {
 
 		this.insertButtonEl = footer.createEl('button', {cls: 'mod-cta obsidian-immich-insert'});
 		this.insertButtonEl.onclick = () => this.insertSelection();
+	}
+
+	private setImporting(importing: boolean) {
+		this.importing = importing;
+		this.contentEl.toggleClass('is-importing', importing);
+		if (this.insertButtonEl) this.insertButtonEl.disabled = importing;
+	}
+
+	private showProgress(progress: ImportProgress) {
+		if (!this.statusEl) return;
+		this.statusEl.setText(
+			'Downloading ' + progress.index + ' of ' + progress.total +
+			(progress.asset.fileName ? ' · ' + progress.asset.fileName : '')
+		);
+		if (this.insertButtonEl) this.insertButtonEl.setText('Downloading…');
 	}
 
 	// Immich's smart search matches on what a photo shows, which no amount of
@@ -793,11 +1438,6 @@ class ImageSelectorModal extends Modal {
 	}
 
 	private renderTile(grid: HTMLElement, asset: ImmichAsset) {
-		const insertionText = this.insertionTextFor(asset);
-		// Nothing sensible to insert for an unknown media type, so leave it out
-		// rather than offering a tile that does nothing.
-		if (insertionText === null) return;
-
 		// A div rather than a button: Obsidian's own button styling imposes a
 		// control height that collapses the tile regardless of aspect-ratio.
 		const tile = grid.createDiv({cls: 'obsidian-immich-tile'});
@@ -863,16 +1503,19 @@ class ImageSelectorModal extends Modal {
 		return this.creds.immichUrl + '/api/assets/' + asset.id;
 	}
 
-	private insertionTextFor(asset: ImmichAsset): string | null {
+	// A hot link back to Immich - the pre-0.7.0 behaviour, and the fallback
+	// whenever a download fails.
+	private linkTextFor(asset: ImmichAsset): string {
 		const url = this.assetUrl(asset);
 		const key = this.creds.immichAlbumKey;
-		if (asset.type === 'IMAGE') {
-			return '![](' + url + '/thumbnail?size=preview&key=' + key + ')\n';
-		}
 		if (asset.type === 'VIDEO') {
 			return '<video src="' + url + '/video/playback?key=' + key + '" controls></video>\n';
 		}
-		return null;
+		return '![](' + url + '/thumbnail?size=preview&key=' + key + ')\n';
+	}
+
+	private isInsertable(asset: ImmichAsset): boolean {
+		return asset.type === 'IMAGE' || asset.type === 'VIDEO';
 	}
 
 	private updateStatus() {
@@ -898,9 +1541,10 @@ class ImageSelectorModal extends Modal {
 			this.statusEl.setText(picked > 0 ? scope + ' · ' + picked + ' selected' : scope);
 		}
 
-		if (this.insertButtonEl) {
+		if (this.insertButtonEl && !this.importing) {
 			this.insertButtonEl.disabled = picked === 0;
-			this.insertButtonEl.setText(picked > 1 ? 'Insert ' + picked + ' items' : 'Insert');
+			const verb = this.insertMode === 'download' ? 'Download' : 'Insert';
+			this.insertButtonEl.setText(picked > 1 ? verb + ' ' + picked + ' items' : verb);
 		}
 
 		// Distinguish "no results" from "empty album" - the fix differs.
@@ -916,21 +1560,74 @@ class ImageSelectorModal extends Modal {
 		}
 	}
 
-	private insertSelection() {
-		if (this.selection.length === 0) return;
+	private async insertSelection() {
+		if (this.selection.length === 0 || this.importing) return;
 
 		const byId = new Map(this.assets.map(asset => [asset.id, asset]));
-		const text = this.selection
+		const chosen = this.selection
 			.map(id => byId.get(id))
-			.map(asset => asset ? this.insertionTextFor(asset) : null)
-			.filter((value): value is string => value !== null)
-			.join('');
+			.filter((asset): asset is ImmichAsset => asset !== undefined);
+		if (chosen.length === 0) return;
 
-		if (text) {
-			this.editor.replaceSelection(text);
-			new Notice('Inserted ' + this.selection.length + (this.selection.length === 1 ? ' item' : ' items') + '.');
+		if (this.insertMode === 'link') {
+			this.editor.replaceSelection(chosen.map(asset => this.linkTextFor(asset)).join(''));
+			new Notice('Inserted ' + chosen.length + (chosen.length === 1 ? ' item' : ' items') + '.');
+			this.close();
+			return;
 		}
-		this.close();
+
+		// Videos are far larger than photos and cannot be shrunk client-side, so
+		// they are always an explicit choice. Asked before any network activity.
+		let downloadVideos = false;
+		const videos = chosen.filter(asset => asset.type === 'VIDEO').length;
+		if (videos > 0) {
+			const choice = await askAboutVideos(this.app, videos);
+			if (choice === 'cancel') return;
+			downloadVideos = choice === 'download';
+		}
+
+		// Captured now: downloads take time and the cursor may move meanwhile.
+		// Writing the whole result once also keeps it to a single undo step.
+		const from = this.editor.getCursor('from');
+		const to = this.editor.getCursor('to');
+
+		this.importer = new AssetImporter(this.app, this.creds, this.sourcePath, {
+			size: this.settings.downloadSize,
+			reencode: this.settings.reencode,
+			maxEdge: this.settings.maxEdge,
+			quality: this.settings.jpegQuality,
+			reuseExisting: this.settings.reuseExistingDownloads,
+			renditionFallback: this.settings.renditionFallback,
+			downloadVideos: downloadVideos
+		});
+		this.setImporting(true);
+
+		try {
+			const result = await this.importer.importAll(
+				chosen,
+				progress => this.showProgress(progress),
+				asset => this.linkTextFor(asset)
+			);
+
+			if (result.cancelled) {
+				new Notice('Download cancelled. Nothing was inserted.');
+				return;
+			}
+
+			this.editor.replaceRange(result.markdown, from, to);
+			const summary = ['Inserted ' + chosen.length + (chosen.length === 1 ? ' item' : ' items') + '.']
+				.concat(result.notes).join(' ');
+			new Notice(summary, result.notes.length > 0 ? 12000 : 4000);
+			this.close();
+		} catch (error) {
+			console.error('[Immich] Import failed:', error);
+			new Notice('Failed to insert. ' + describeException(error));
+		} finally {
+			this.setImporting(false);
+			this.importer = null;
+			if (this.insertButtonEl) this.insertButtonEl.setText('Insert');
+			this.updateStatus();
+		}
 	}
 
 	onClose() {
@@ -945,6 +1642,8 @@ class ImageSelectorModal extends Modal {
 		this.statusEl = null;
 		this.insertButtonEl = null;
 		this.searchEl = null;
+		this.modeEl = null;
+		this.cancelButtonEl = null;
 		this.resetState();
 		this.contentEl.empty();
 	}
@@ -1000,6 +1699,103 @@ class SettingTab extends PluginSettingTab {
 					this.plugin.settings.immichAlbumKeySecret = secretId ?? '';
 					await this.plugin.saveSettings();
 				}));
+		new Setting(containerEl).setName('Downloads').setHeading();
+
+		new Setting(containerEl)
+			.setName('Insert photos as')
+			.setDesc('The picker has a Link/Download toggle that overrides this for a single insert.')
+			.addDropdown(dropdown => dropdown
+				.addOption('link', 'A link to Immich (needs the server online)')
+				.addOption('download', 'A copy downloaded into the vault')
+				.setValue(this.plugin.settings.insertMode)
+				.onChange(async (value) => {
+					this.plugin.settings.insertMode = value as InsertMode;
+					await this.plugin.saveSettings();
+				}));
+
+		const sizeSetting = new Setting(containerEl)
+			.setName('Downloaded size')
+			.addDropdown(dropdown => dropdown
+				.addOption('original', 'Original (largest, as uploaded)')
+				.addOption('fullsize', 'Large')
+				.addOption('preview', 'Medium (recommended)')
+				.addOption('thumbnail', 'Small')
+				.setValue(this.plugin.settings.downloadSize)
+				.onChange(async (value) => {
+					this.plugin.settings.downloadSize = value as RenditionSize;
+					await this.plugin.saveSettings();
+					// The warning and the fallback row below depend on this.
+					this.display();
+				}));
+		sizeSetting.setDesc(this.plugin.settings.downloadSize === 'original'
+			? 'Originals from phones are often HEIC, which Obsidian cannot display. Original and Large ' +
+				'also require the album share link to allow downloads.'
+			: 'Medium and Small are rendered by Immich, so they are always a format Obsidian can display.');
+
+		if (this.plugin.settings.downloadSize === 'original') {
+			new Setting(containerEl)
+				.setName('Fall back to a rendered image')
+				.setDesc('When an original cannot be displayed by Obsidian (HEIC, RAW), download Immich\'s ' +
+					'rendered version instead. With this off, such files are saved as-is and inserted as ' +
+					'links rather than embedded images.')
+				.addToggle(toggle => toggle
+					.setValue(this.plugin.settings.renditionFallback)
+					.onChange(async (value) => {
+						this.plugin.settings.renditionFallback = value;
+						await this.plugin.saveSettings();
+					}));
+		}
+
+		new Setting(containerEl)
+			.setName('Shrink images after downloading')
+			.setDesc('Re-compresses images inside Obsidian. Strips EXIF metadata, including dates and ' +
+				'location. Never applied to GIFs or SVGs.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.reencode)
+				.onChange(async (value) => {
+					this.plugin.settings.reencode = value;
+					await this.plugin.saveSettings();
+					this.display();
+				}));
+
+		if (this.plugin.settings.reencode) {
+			new Setting(containerEl)
+				.setName('Maximum edge')
+				.setDesc('Longest side in pixels. Larger images are scaled down; smaller ones are left alone.')
+				.addSlider(slider => slider
+					.setLimits(256, 8192, 128)
+					.setValue(this.plugin.settings.maxEdge)
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						this.plugin.settings.maxEdge = value;
+						await this.plugin.saveSettings();
+					}));
+
+			new Setting(containerEl)
+				.setName('JPEG quality')
+				.setDesc('Lower means smaller files and more visible compression.')
+				.addSlider(slider => slider
+					.setLimits(30, 100, 5)
+					.setValue(Math.round(this.plugin.settings.jpegQuality * 100))
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						this.plugin.settings.jpegQuality = value / 100;
+						await this.plugin.saveSettings();
+					}));
+		}
+
+		new Setting(containerEl)
+			.setName('Reuse existing downloads')
+			.setDesc('If a photo has already been downloaded into this vault, link the existing file ' +
+				'instead of downloading it again. Detected by the asset id in the filename, so renaming ' +
+				'a downloaded file will cause it to be fetched again.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.reuseExistingDownloads)
+				.onChange(async (value) => {
+					this.plugin.settings.reuseExistingDownloads = value;
+					await this.plugin.saveSettings();
+				}));
+
 		new Setting(containerEl)
 			.setName('Test connection')
 			.setDesc('Validate the connection between obsidian and your immich instance.')
