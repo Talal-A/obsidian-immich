@@ -14,9 +14,9 @@ Addresses the findings from the [Obsidian community plugin scorecard](https://co
 
 ### Fixed
 
-- Server responses are narrowed at the boundary instead of flowing through the code as `any`. The album's assets were previously cast straight to `ImmichAsset[]`, so a non-string id could have ended up in an asset URL.
+- Server responses are narrowed at the boundary instead of flowing through the code as `any`. Among other things this fixes a latent bug where `String(raw['id'] ?? '')` would have put `"[object Object]"` into a filename or an asset URL had Immich returned a non-string.
 - `testConnection` is awaited, so a failure outside its own error handling is no longer an unhandled rejection. The button is disabled while it runs.
-- The picker's timers are scheduled on `activeWindow`, so scroll loading works in a popout window.
+- The picker's timers are scheduled on `activeWindow`, so search and autofocus work in a popout window.
 - An invalid or empty Immich URL produces a message naming the setting, rather than a bare `TypeError` from whichever request happened to be built first.
 
 ### Changed

@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-immich",
-	"version": "0.4.0",
+	"version": "0.5.0",
 	"description": "Link your Immich images within your Obsidian vault.",
 	"main": "main.js",
 	"scripts": {
