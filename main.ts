@@ -155,6 +155,11 @@ function describeHttpFailure(status: number, context: string, auth: AuthKind): s
 					'the album share key may be wrong.'
 				: 'Immich denied access (403) while ' + context + '. The API key is most likely missing a ' +
 					'required permission - this plugin needs ' + REQUIRED_PERMISSIONS + '.';
+		case 400:
+			// Smart search is the one call that depends on the server having
+			// machine learning turned on, so a rejected request usually means that.
+			return 'Immich rejected the request (400) while ' + context +
+				'. Smart search requires machine learning to be enabled on your Immich server.';
 		case 404:
 			return 'Immich returned not found (404) while ' + context + '. Check the Immich URL and album ID.';
 		default:
@@ -376,6 +381,34 @@ async function fetchAlbumAssets(creds: ImmichCredentials, album: Record<string, 
 	return assets;
 }
 
+// Immich's smart search is CLIP-based: it matches on what a photo depicts
+// rather than on its filename, so it has to run server-side. Results come back
+// ranked by relevance, so only the first page is worth taking.
+const SMART_SEARCH_LIMIT = 250;
+
+async function smartSearch(creds: ImmichCredentials, query: string, type: string): Promise<ImmichAsset[]> {
+	const body: Record<string, unknown> = {
+		query: query,
+		albumIds: [creds.immichAlbum],
+		size: SMART_SEARCH_LIMIT,
+		page: 1,
+		withExif: true
+	};
+	if (type !== 'ALL') {
+		body['type'] = type;
+	}
+
+	const result = await immichRequest({
+		url: new URL(creds.immichUrl + '/api/search/smart').toString(),
+		method: 'POST',
+		headers: { ...apiHeaders(creds), 'Content-Type': 'application/json' },
+		body: JSON.stringify(body)
+	}, 'running a smart search');
+
+	const items: Record<string, unknown>[] = result.json?.['assets']?.['items'] ?? [];
+	return items.map(toImmichAsset);
+}
+
 async function refreshCacheFromImmich(creds: ImmichCredentials, silent=true) {
 	// A missing secret usually means the keychain entry was deleted or renamed,
 	// which is worth saying plainly rather than sending an unauthenticated call.
@@ -509,11 +542,17 @@ class ImageSelectorModal extends Modal {
 	private query = '';
 	private typeFilter: TypeFilter = 'ALL';
 	private rendered = 0;
+	// Non-null once a smart search has run: its ranked results stand in for the
+	// album until the query is edited again.
+	private smartResults: ImmichAsset[] | null = null;
+	private smartQuery = '';
+	private searching = false;
 
 	private gridEl: HTMLElement | null = null;
 	private sentinelEl: HTMLElement | null = null;
 	private statusEl: HTMLElement | null = null;
 	private insertButtonEl: HTMLButtonElement | null = null;
+	private searchEl: HTMLInputElement | null = null;
 	private observer: IntersectionObserver | null = null;
 	private searchDebounce: number | null = null;
 
@@ -571,6 +610,9 @@ class ImageSelectorModal extends Modal {
 		this.typeFilter = 'ALL';
 		this.rendered = 0;
 		this.visible = [];
+		this.smartResults = null;
+		this.smartQuery = '';
+		this.searching = false;
 	}
 
 	private buildHeader(parent: HTMLElement, albumName: string) {
@@ -603,21 +645,46 @@ class ImageSelectorModal extends Modal {
 
 		const search = toolbar.createEl('input', {
 			cls: 'obsidian-immich-search',
-			attr: {type: 'search', placeholder: 'Search by name, place, or date…', spellcheck: 'false'}
+			attr: {
+				type: 'search',
+				placeholder: 'Filter by name, place or date — press Enter to search by content',
+				spellcheck: 'false'
+			}
 		});
+		this.searchEl = search;
 		search.addEventListener('input', () => {
 			if (this.searchDebounce) window.clearTimeout(this.searchDebounce);
 			// Debounced so that typing does not rebuild the grid on every keystroke.
 			this.searchDebounce = window.setTimeout(() => {
 				this.query = search.value;
+				// Editing the query drops back to instant local filtering; the
+				// smart results no longer correspond to what is in the box.
+				this.smartResults = null;
+				this.smartQuery = '';
 				this.applyFilter();
 			}, 120);
 		});
-		// Let the user go straight from typing to inserting.
 		search.addEventListener('keydown', (event: KeyboardEvent) => {
-			if (event.key === 'Enter' && this.selection.length > 0) {
+			// Escape clears the search before it closes the modal, so an
+			// unwanted search does not cost the whole selection.
+			if (event.key === 'Escape' && (this.smartResults !== null || search.value !== '')) {
 				event.preventDefault();
+				event.stopPropagation();
+				search.value = '';
+				this.query = '';
+				this.smartResults = null;
+				this.smartQuery = '';
+				this.applyFilter();
+				return;
+			}
+			if (event.key !== 'Enter') return;
+			event.preventDefault();
+			// Enter searches; the modifier inserts, so a search cannot be
+			// mistaken for a commit into the note.
+			if (event.metaKey || event.ctrlKey) {
 				this.insertSelection();
+			} else {
+				this.runSmartSearch(search.value.trim());
 			}
 		});
 		window.setTimeout(() => search.focus(), 0);
@@ -669,9 +736,42 @@ class ImageSelectorModal extends Modal {
 		this.insertButtonEl.onclick = () => this.insertSelection();
 	}
 
+	// Immich's smart search matches on what a photo shows, which no amount of
+	// local filename matching can approximate - so it runs against the server.
+	private async runSmartSearch(query: string) {
+		if (this.searching) return;
+		if (!query) {
+			this.smartResults = null;
+			this.smartQuery = '';
+			this.applyFilter();
+			return;
+		}
+
+		this.searching = true;
+		this.updateStatus();
+		try {
+			const results = await smartSearch(this.creds, query, this.typeFilter);
+			this.smartResults = results;
+			this.smartQuery = query;
+		} catch (error) {
+			console.error('[Immich] Smart search failed:', error);
+			new Notice('Smart search failed. ' + describeException(error));
+			this.smartResults = null;
+			this.smartQuery = '';
+		} finally {
+			this.searching = false;
+			this.applyFilter();
+		}
+	}
+
 	private applyFilter() {
-		const tokens = this.query.toLowerCase().split(/\s+/).filter(Boolean);
-		this.visible = this.assets.filter(asset =>
+		// In smart mode the server has already decided which assets match, and
+		// its ranking is the point - so only the type filter is applied on top.
+		const inSmartMode = this.smartResults !== null;
+		const source = this.smartResults ?? this.assets;
+		const tokens = inSmartMode ? [] : this.query.toLowerCase().split(/\s+/).filter(Boolean);
+
+		this.visible = source.filter(asset =>
 			(this.typeFilter === 'ALL' || asset.type === this.typeFilter) && matchesQuery(asset, tokens)
 		);
 
@@ -781,9 +881,20 @@ class ImageSelectorModal extends Modal {
 		const picked = this.selection.length;
 
 		if (this.statusEl) {
-			const scope = shown === total
-				? total + (total === 1 ? ' item' : ' items')
-				: shown + ' of ' + total + ' items';
+			let scope: string;
+			if (this.searching) {
+				scope = 'Searching…';
+			} else if (this.smartResults !== null) {
+				// Say when the result set was capped rather than letting it look
+				// like the album simply contains that many matches.
+				const capped = this.smartResults.length >= SMART_SEARCH_LIMIT ? 'top ' : '';
+				scope = capped + shown + ' result' + (shown === 1 ? '' : 's') +
+					' for “' + this.smartQuery + '” · Esc to clear';
+			} else {
+				scope = shown === total
+					? total + (total === 1 ? ' item' : ' items')
+					: shown + ' of ' + total + ' items';
+			}
 			this.statusEl.setText(picked > 0 ? scope + ' · ' + picked + ' selected' : scope);
 		}
 
@@ -794,10 +905,13 @@ class ImageSelectorModal extends Modal {
 
 		// Distinguish "no results" from "empty album" - the fix differs.
 		const existing = this.gridEl?.parentElement?.querySelector('.obsidian-immich-noresults');
-		if (shown === 0 && !existing && this.gridEl?.parentElement) {
-			this.gridEl.parentElement.createDiv({cls: 'obsidian-immich-noresults'})
-				.setText('Nothing matches that search.');
-		} else if (shown > 0 && existing) {
+		if (shown === 0 && !this.searching && !existing && this.gridEl?.parentElement) {
+			this.gridEl.parentElement.createDiv({cls: 'obsidian-immich-noresults'}).setText(
+				this.smartResults !== null
+					? 'Immich found nothing in this album matching “' + this.smartQuery + '”.'
+					: 'Nothing matches that filter. Press Enter to search by image content instead.'
+			);
+		} else if ((shown > 0 || this.searching) && existing) {
 			existing.remove();
 		}
 	}
@@ -830,6 +944,7 @@ class ImageSelectorModal extends Modal {
 		this.sentinelEl = null;
 		this.statusEl = null;
 		this.insertButtonEl = null;
+		this.searchEl = null;
 		this.resetState();
 		this.contentEl.empty();
 	}

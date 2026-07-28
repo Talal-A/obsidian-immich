@@ -10,8 +10,9 @@ Your API key and album share key are stored in Obsidian's keychain, which encryp
 
 ## Features
 
-- View all images from a single shared album within Immich.
-- One-click insertion of one or many images into your vault.
+- Browse a shared Immich album in a masonry grid that keeps each photo's own aspect ratio.
+- Filter instantly by filename, place, or date; press Enter to run Immich's smart (content-based) search against the album.
+- Select any number of photos or videos and insert them together, in the order you picked them.
 
 ## Prerequisites 
 This assumes you have a working version of [immich](https://github.com/immich-app/immich) hosted. It does not necessarily need to be remotely accessible. This decision is left up to the reader.
@@ -70,6 +71,12 @@ The following commands are available for use.
 
 #### Insert from album
 The standard insertion command. Please note you must have an open editor focused to use this command. Brings up the image selection modal.
+
+In the picker:
+- **Type** to filter the album instantly by filename, place, or date. Several words narrow the results rather than widening them.
+- **Enter** runs Immich's smart search, which matches on what a photo shows rather than what it is called - so "sunset over water" works even when nothing is named that. This requires machine learning to be enabled on your Immich server.
+- **Escape** clears the search; **Cmd/Ctrl+Enter** inserts the current selection.
+- Click a photo to select it, then press Insert. Photos are inserted in the order you selected them.
 
 #### Refresh album cache
 The "Insert from album" command caches some information such as available images/videos, urls, and other metadata related to the album when it is first run. If you find that new images or changes are not showing up in the image selection modal, running this command will refresh the caches.
