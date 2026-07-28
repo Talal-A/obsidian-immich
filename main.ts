@@ -37,6 +37,37 @@ interface ImmichCredentials {
 interface ImmichAsset {
 	id: string;
 	type: string;
+	fileName: string;
+	// ISO timestamp, kept as the raw string - only ever shown as a date and
+	// matched as text, so there is no reason to parse it.
+	taken: string;
+	place: string;
+}
+
+// Immich returns a large asset object; keep only what the picker displays or
+// searches on, since the whole album is held in memory.
+function toImmichAsset(raw: Record<string, unknown>): ImmichAsset {
+	const exif = (raw['exifInfo'] ?? {}) as Record<string, unknown>;
+	const place = [exif['city'], exif['country']].filter(Boolean).join(', ');
+	return {
+		id: String(raw['id'] ?? ''),
+		type: String(raw['type'] ?? ''),
+		fileName: String(raw['originalFileName'] ?? ''),
+		taken: String(raw['localDateTime'] ?? raw['fileCreatedAt'] ?? ''),
+		place: place
+	};
+}
+
+// Everything the search box matches against, precomputed per asset.
+function assetHaystack(asset: ImmichAsset): string {
+	return [asset.fileName, asset.place, asset.taken.slice(0, 10), asset.type].join(' ').toLowerCase();
+}
+
+function matchesQuery(asset: ImmichAsset, tokens: string[]): boolean {
+	if (tokens.length === 0) return true;
+	const haystack = assetHaystack(asset);
+	// Every token must match somewhere, so extra words narrow rather than widen.
+	return tokens.every(token => haystack.includes(token));
 }
 
 interface AlbumCache {
@@ -297,7 +328,7 @@ async function testConnection(creds: ImmichCredentials) {
 async function fetchAlbumAssets(creds: ImmichCredentials, album: Record<string, unknown>): Promise<ImmichAsset[]> {
 	const inlined = album['assets'];
 	if (Array.isArray(inlined)) {
-		return inlined as ImmichAsset[];
+		return inlined.map(toImmichAsset);
 	}
 
 	const url = new URL(creds.immichUrl + '/api/search/metadata');
@@ -316,13 +347,15 @@ async function fetchAlbumAssets(creds: ImmichCredentials, album: Record<string, 
 				albumIds: [creds.immichAlbum],
 				order: order,
 				page: page,
-				size: pageSize
+				size: pageSize,
+				// Supplies the city/country the picker's search matches on.
+				withExif: true
 			})
 		}, 'listing the album\'s assets');
 
 		const searchAssets = result.json?.['assets'];
-		const items: ImmichAsset[] = searchAssets?.['items'] ?? [];
-		assets.push(...items);
+		const items: Record<string, unknown>[] = searchAssets?.['items'] ?? [];
+		assets.push(...items.map(toImmichAsset));
 
 		const nextPage = Number(searchAssets?.['nextPage']);
 		page = Number.isFinite(nextPage) && nextPage > page ? nextPage : 0;
@@ -450,210 +483,323 @@ export default class ObsidianImmich extends Plugin {
 	}
 }
 
+type TypeFilter = 'ALL' | 'IMAGE' | 'VIDEO';
+
+// How many tiles to append per chunk. The grid renders incrementally so that a
+// large album does not build thousands of elements before first paint; an
+// IntersectionObserver on a sentinel at the end of the grid pulls the next
+// chunk in as the user approaches it.
+const RENDER_CHUNK = 60;
+
 class ImageSelectorModal extends Modal {
 	editor: Editor;
 	creds: ImmichCredentials;
-	currentPage: number;
-	batchSize: number;
-	loadedAssets: Map<number, HTMLElement>;
-	scrollContainer: HTMLElement | null;
-	isLoading: boolean;
-	scrollTimeout: number | null;
+
+	private assets: ImmichAsset[] = [];
+	private visible: ImmichAsset[] = [];
+	// Insertion order matters: assets are inserted in the order they were
+	// picked, not the order they appear in the album.
+	private selection: string[] = [];
+	private query = '';
+	private typeFilter: TypeFilter = 'ALL';
+	private rendered = 0;
+
+	private gridEl: HTMLElement | null = null;
+	private sentinelEl: HTMLElement | null = null;
+	private statusEl: HTMLElement | null = null;
+	private insertButtonEl: HTMLButtonElement | null = null;
+	private observer: IntersectionObserver | null = null;
+	private searchDebounce: number | null = null;
 
 	constructor(app: App, editor: Editor, creds: ImmichCredentials) {
 		super(app);
 		this.editor = editor;
 		this.creds = creds;
-		this.currentPage = 0;
-		this.batchSize = 6;
-		this.loadedAssets = new Map();
-		this.scrollContainer = null;
-		this.isLoading = false;
-		this.scrollTimeout = null;
 	}
 
 	async onOpen() {
-		const {contentEl} = this;
+		const {contentEl, modalEl} = this;
+		modalEl.addClass('obsidian-immich-modal');
+		contentEl.addClass('obsidian-immich-picker');
 
-		// Reset paging state so that reopening after a refresh starts from the
-		// top of the album rather than resuming an old scroll position.
-		this.currentPage = 0;
-		this.isLoading = false;
-		this.loadedAssets.clear();
+		this.resetState();
+
+		const loading = contentEl.createDiv({cls: 'obsidian-immich-empty'});
+		loading.setText('Loading album…');
 
 		if (cachedResult == null || cachedResult.fingerprint !== credentialsFingerprint(this.creds)) {
 			try {
 				await refreshCacheFromImmich(this.creds);
 			} catch (error) {
 				console.error('[Immich] Failed to load album:', error);
-				contentEl.createDiv({cls: 'obsidian-immich-empty'}).setText(
-					'Failed to load the immich album. ' + describeException(error)
-				);
+				loading.setText('Failed to load the immich album. ' + describeException(error));
 				return;
 			}
 		}
+		loading.remove();
 
 		const cache = cachedResult;
-		if (cache == null) {
-			return;
-		}
+		if (cache == null) return;
+		// Drop anything the picker could not insert anyway, so that every count
+		// it reports matches the number of tiles actually on screen.
+		this.assets = cache.assets.filter(asset => this.insertionTextFor(asset) !== null);
 
-		// Create header with title and refresh button
-		const header = contentEl.createDiv({cls: 'obsidian-immich-header'});
+		this.buildHeader(contentEl, cache.albumName);
 
-		const titleDiv = header.createDiv({cls: 'obsidian-immich-title'});
-		titleDiv.setText('Insert from album: ' + (cache.albumName || 'Select Image'));
-
-		const refreshButton = header.createEl('button', {
-			text: '\u21bb',
-			cls: 'obsidian-immich-refresh-button'
-		});
-		refreshButton.onclick = async () => {
-			refreshButton.disabled = true;
-			refreshButton.setText('Loading...');
-			try {
-				await refreshCacheFromImmich(this.creds, false);
-				// Reload the modal
-				this.onClose();
-				await this.onOpen();
-			} catch (error) {
-				new Notice('Failed to refresh cache. ' + describeException(error));
-				console.error('Refresh failed:', error);
-				refreshButton.disabled = false;
-				refreshButton.setText('\u21bb Refresh');
-			}
-		};
-
-		const totalAssets = cache.assets.length;
-
-		if (totalAssets === 0) {
+		if (this.assets.length === 0) {
 			contentEl.createDiv({cls: 'obsidian-immich-empty'}).setText(
-				'This album has no assets. Add images to it in immich, then refresh.'
+				'This album has no assets. Add some in immich, then refresh.'
 			);
 			return;
 		}
 
-		// Create scroll container
-		this.scrollContainer = contentEl.createDiv({cls: 'obsidian-immich-scroll-container'});
-		this.scrollContainer.setAttribute('data-immich-modal-content', 'true');
-
-		const row = this.scrollContainer.createDiv({cls: 'obsidian-immich-row'});
-		const leftImageDiv = row.createDiv({cls: 'obsidian-immich-column'});
-		const rightImageDiv = row.createDiv({cls: 'obsidian-immich-column'});
-		const left = leftImageDiv.createDiv({cls: 'obsidian-immich-column-content'});
-		const right = rightImageDiv.createDiv({cls: 'obsidian-immich-column-content'});
-
-		// Create loading indicator inside scroll container
-		const loadingDiv = this.scrollContainer.createDiv({cls: 'obsidian-immich-loading'});
-		loadingDiv.setText('Loading images...');
-		loadingDiv.style.display = 'none';
-
-		// Setup scroll listener with throttling
-		this.setupScrollListener(left, right, totalAssets, loadingDiv);
-
-		// Initial load: load more items to ensure scrollbar appears on large screens
-		const initialBatchSize = Math.max(this.batchSize * 3, 20); // Load at least 20 items initially
-		this.loadBatch(left, right, 0, Math.min(initialBatchSize, totalAssets), loadingDiv, totalAssets);
+		this.buildToolbar(contentEl);
+		this.buildGrid(contentEl);
+		this.buildFooter(contentEl);
+		this.applyFilter();
 	}
 
-	private setupScrollListener(left: HTMLElement, right: HTMLElement, totalAssets: number, loadingDiv: HTMLElement) {
-		if (!this.scrollContainer) return;
+	private resetState() {
+		this.selection = [];
+		this.query = '';
+		this.typeFilter = 'ALL';
+		this.rendered = 0;
+		this.visible = [];
+	}
 
-		this.scrollContainer.addEventListener('scroll', () => {
-			if (this.scrollTimeout) {
-				clearTimeout(this.scrollTimeout);
+	private buildHeader(parent: HTMLElement, albumName: string) {
+		const header = parent.createDiv({cls: 'obsidian-immich-header'});
+		const titles = header.createDiv({cls: 'obsidian-immich-titles'});
+		titles.createDiv({cls: 'obsidian-immich-title'}).setText(albumName || 'Immich album');
+		this.statusEl = titles.createDiv({cls: 'obsidian-immich-subtitle'});
+
+		const refresh = header.createEl('button', {cls: 'obsidian-immich-refresh'});
+		refresh.setText('Refresh');
+		refresh.setAttribute('aria-label', 'Reload the album from immich');
+		refresh.onclick = async () => {
+			refresh.disabled = true;
+			refresh.setText('Refreshing…');
+			try {
+				await refreshCacheFromImmich(this.creds, false);
+				this.onClose();
+				await this.onOpen();
+			} catch (error) {
+				console.error('[Immich] Refresh failed:', error);
+				new Notice('Failed to refresh cache. ' + describeException(error));
+				refresh.disabled = false;
+				refresh.setText('Refresh');
 			}
+		};
+	}
 
-			this.scrollTimeout = window.setTimeout(() => {
-				this.checkAndLoadMore(left, right, totalAssets, loadingDiv);
-			}, 150); // Throttle to 150ms
+	private buildToolbar(parent: HTMLElement) {
+		const toolbar = parent.createDiv({cls: 'obsidian-immich-toolbar'});
+
+		const search = toolbar.createEl('input', {
+			cls: 'obsidian-immich-search',
+			attr: {type: 'search', placeholder: 'Search by name, place, or date…', spellcheck: 'false'}
 		});
+		search.addEventListener('input', () => {
+			if (this.searchDebounce) window.clearTimeout(this.searchDebounce);
+			// Debounced so that typing does not rebuild the grid on every keystroke.
+			this.searchDebounce = window.setTimeout(() => {
+				this.query = search.value;
+				this.applyFilter();
+			}, 120);
+		});
+		// Let the user go straight from typing to inserting.
+		search.addEventListener('keydown', (event: KeyboardEvent) => {
+			if (event.key === 'Enter' && this.selection.length > 0) {
+				event.preventDefault();
+				this.insertSelection();
+			}
+		});
+		window.setTimeout(() => search.focus(), 0);
+
+		const filters = toolbar.createDiv({cls: 'obsidian-immich-filters'});
+		const options: Array<{key: TypeFilter, label: string}> = [
+			{key: 'ALL', label: 'All'},
+			{key: 'IMAGE', label: 'Photos'},
+			{key: 'VIDEO', label: 'Videos'}
+		];
+		for (const option of options) {
+			const button = filters.createEl('button', {cls: 'obsidian-immich-filter'});
+			button.setText(option.label);
+			button.toggleClass('is-active', this.typeFilter === option.key);
+			button.onclick = () => {
+				this.typeFilter = option.key;
+				filters.findAll('.obsidian-immich-filter').forEach(el => el.removeClass('is-active'));
+				button.addClass('is-active');
+				this.applyFilter();
+			};
+		}
 	}
 
-	private checkAndLoadMore(left: HTMLElement, right: HTMLElement, totalAssets: number, loadingDiv: HTMLElement) {
-		if (!this.scrollContainer || this.isLoading || this.currentPage >= totalAssets) {
-			return;
-		}
+	private buildGrid(parent: HTMLElement) {
+		const scroller = parent.createDiv({cls: 'obsidian-immich-scroll'});
+		this.gridEl = scroller.createDiv({cls: 'obsidian-immich-grid'});
+		this.sentinelEl = scroller.createDiv({cls: 'obsidian-immich-sentinel'});
 
-		const scrollTop = this.scrollContainer.scrollTop;
-		const scrollHeight = this.scrollContainer.scrollHeight;
-		const clientHeight = this.scrollContainer.clientHeight;
-		const scrollPercentage = (scrollTop + clientHeight) / scrollHeight;
-
-		// Load more when user scrolls past 60% or when near bottom
-		if (scrollPercentage > 0.6 || (scrollHeight - (scrollTop + clientHeight) < 300)) {
-			const endIndex = Math.min(this.currentPage + this.batchSize, totalAssets);
-			this.loadBatch(left, right, this.currentPage, endIndex, loadingDiv, totalAssets);
-		}
+		this.observer = new IntersectionObserver(entries => {
+			if (entries.some(entry => entry.isIntersecting)) {
+				this.renderChunk();
+			}
+		}, {root: scroller, rootMargin: '400px'});
+		this.observer.observe(this.sentinelEl);
 	}
 
-	private loadBatch(left: HTMLElement, right: HTMLElement, startIndex: number, endIndex: number, loadingDiv: HTMLElement, totalAssets: number) {
-		if (this.isLoading || startIndex >= totalAssets) return;
+	private buildFooter(parent: HTMLElement) {
+		const footer = parent.createDiv({cls: 'obsidian-immich-footer'});
 
-		const assets = cachedResult?.assets;
-		if (!assets) return;
+		const clear = footer.createEl('button', {cls: 'obsidian-immich-clear'});
+		clear.setText('Clear selection');
+		clear.onclick = () => {
+			this.selection = [];
+			this.gridEl?.findAll('.obsidian-immich-tile').forEach(el => el.removeClass('is-selected'));
+			this.updateStatus();
+		};
 
-		this.isLoading = true;
-		loadingDiv.style.display = 'block';
+		this.insertButtonEl = footer.createEl('button', {cls: 'mod-cta obsidian-immich-insert'});
+		this.insertButtonEl.onclick = () => this.insertSelection();
+	}
 
-		for (let i = startIndex; i < endIndex; i++) {
-			if (this.loadedAssets.has(i)) continue;
+	private applyFilter() {
+		const tokens = this.query.toLowerCase().split(/\s+/).filter(Boolean);
+		this.visible = this.assets.filter(asset =>
+			(this.typeFilter === 'ALL' || asset.type === this.typeFilter) && matchesQuery(asset, tokens)
+		);
 
-			const asset = assets[i];
-			const assetUrl = this.creds.immichUrl + '/api/assets/' + asset['id'];
-			const keyParam = '&key=' + this.creds.immichAlbumKey;
-			const thumbUrl = assetUrl + '/thumbnail?size=thumbnail' + keyParam;
+		this.rendered = 0;
+		if (this.gridEl) this.gridEl.empty();
+		this.renderChunk();
+		this.updateStatus();
+	}
 
-			let insertionText: string;
-			if (asset['type'] === "IMAGE") {
-				insertionText = '![](' + assetUrl + '/thumbnail?size=preview' + keyParam + ')\n';
-			} else if (asset['type'] === "VIDEO") {
-				insertionText = '<video src="' + assetUrl + '/video/playback?key=' + this.creds.immichAlbumKey + '" controls></video>\n';
+	private renderChunk() {
+		const grid = this.gridEl;
+		if (!grid || this.rendered >= this.visible.length) return;
+
+		const end = Math.min(this.rendered + RENDER_CHUNK, this.visible.length);
+		for (let i = this.rendered; i < end; i++) {
+			this.renderTile(grid, this.visible[i]);
+		}
+		this.rendered = end;
+	}
+
+	private renderTile(grid: HTMLElement, asset: ImmichAsset) {
+		const insertionText = this.insertionTextFor(asset);
+		// Nothing sensible to insert for an unknown media type, so leave it out
+		// rather than offering a tile that does nothing.
+		if (insertionText === null) return;
+
+		const tile = grid.createEl('button', {cls: 'obsidian-immich-tile'});
+		tile.setAttribute('type', 'button');
+		tile.toggleClass('is-selected', this.selection.includes(asset.id));
+		tile.setAttribute('aria-label', asset.fileName || 'Immich asset');
+
+		const img = tile.createEl('img', {attr: {loading: 'lazy', decoding: 'async', alt: ''}});
+		img.src = this.assetUrl(asset) + '/thumbnail?size=thumbnail&key=' + this.creds.immichAlbumKey;
+		img.onerror = () => {
+			tile.addClass('is-broken');
+			tile.setText('Failed to load');
+		};
+
+		if (asset.type === 'VIDEO') {
+			tile.createDiv({cls: 'obsidian-immich-badge'}).setText('Video');
+		}
+		tile.createDiv({cls: 'obsidian-immich-check'}).setText('✓');
+
+		const caption = tile.createDiv({cls: 'obsidian-immich-caption'});
+		caption.setText(asset.fileName || asset.taken.slice(0, 10));
+		caption.setAttribute('title', [asset.fileName, asset.place, asset.taken.slice(0, 10)]
+			.filter(Boolean).join(' · '));
+
+		tile.onclick = () => {
+			const at = this.selection.indexOf(asset.id);
+			if (at === -1) {
+				this.selection.push(asset.id);
+				tile.addClass('is-selected');
 			} else {
-				// Unknown asset type - nothing sensible to insert, so skip it
-				// rather than rendering a tile that inserts `undefined`.
-				continue;
+				this.selection.splice(at, 1);
+				tile.removeClass('is-selected');
 			}
+			this.updateStatus();
+		};
+	}
 
-			const targetColumn = (i & 1) ? right : left;
-			const overallDiv = targetColumn.createDiv({cls: 'obsidian-immich-overallDiv'});
+	private assetUrl(asset: ImmichAsset): string {
+		return this.creds.immichUrl + '/api/assets/' + asset.id;
+	}
 
-			const imgElement = overallDiv.createEl("img");
-			imgElement.src = thumbUrl;
+	private insertionTextFor(asset: ImmichAsset): string | null {
+		const url = this.assetUrl(asset);
+		const key = this.creds.immichAlbumKey;
+		if (asset.type === 'IMAGE') {
+			return '![](' + url + '/thumbnail?size=preview&key=' + key + ')\n';
+		}
+		if (asset.type === 'VIDEO') {
+			return '<video src="' + url + '/video/playback?key=' + key + '" controls></video>\n';
+		}
+		return null;
+	}
 
-			imgElement.onclick = () => {
-				this.editor.replaceSelection(insertionText);
-				overallDiv.setCssStyles({opacity: '0.5'});
-			};
+	private updateStatus() {
+		const total = this.assets.length;
+		const shown = this.visible.length;
+		const picked = this.selection.length;
 
-			imgElement.onerror = () => {
-				overallDiv.setText('Failed to load');
-			};
-
-			this.loadedAssets.set(i, overallDiv);
+		if (this.statusEl) {
+			const scope = shown === total
+				? total + (total === 1 ? ' item' : ' items')
+				: shown + ' of ' + total + ' items';
+			this.statusEl.setText(picked > 0 ? scope + ' · ' + picked + ' selected' : scope);
 		}
 
-		this.currentPage = endIndex;
+		if (this.insertButtonEl) {
+			this.insertButtonEl.disabled = picked === 0;
+			this.insertButtonEl.setText(picked > 1 ? 'Insert ' + picked + ' items' : 'Insert');
+		}
 
-		setTimeout(() => {
-			this.isLoading = false;
-			if (endIndex >= totalAssets) {
-				loadingDiv.style.display = 'none';
-			}
-		}, 100);
+		// Distinguish "no results" from "empty album" - the fix differs.
+		const existing = this.gridEl?.parentElement?.querySelector('.obsidian-immich-noresults');
+		if (shown === 0 && !existing && this.gridEl?.parentElement) {
+			this.gridEl.parentElement.createDiv({cls: 'obsidian-immich-noresults'})
+				.setText('Nothing matches that search.');
+		} else if (shown > 0 && existing) {
+			existing.remove();
+		}
+	}
+
+	private insertSelection() {
+		if (this.selection.length === 0) return;
+
+		const byId = new Map(this.assets.map(asset => [asset.id, asset]));
+		const text = this.selection
+			.map(id => byId.get(id))
+			.map(asset => asset ? this.insertionTextFor(asset) : null)
+			.filter((value): value is string => value !== null)
+			.join('');
+
+		if (text) {
+			this.editor.replaceSelection(text);
+			new Notice('Inserted ' + this.selection.length + (this.selection.length === 1 ? ' item' : ' items') + '.');
+		}
+		this.close();
 	}
 
 	onClose() {
-		if (this.scrollTimeout) {
-			clearTimeout(this.scrollTimeout);
-			this.scrollTimeout = null;
+		if (this.searchDebounce) {
+			window.clearTimeout(this.searchDebounce);
+			this.searchDebounce = null;
 		}
-		this.loadedAssets.clear();
-		this.scrollContainer = null;
-		this.currentPage = 0;
-		this.isLoading = false;
-		const {contentEl} = this;
-		contentEl.empty();
+		this.observer?.disconnect();
+		this.observer = null;
+		this.gridEl = null;
+		this.sentinelEl = null;
+		this.statusEl = null;
+		this.insertButtonEl = null;
+		this.resetState();
+		this.contentEl.empty();
 	}
 }
 
