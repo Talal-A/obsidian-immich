@@ -188,83 +188,45 @@ function describeException(exception: unknown): string {
 	return exception instanceof Error ? exception.message : String(exception);
 }
 
+// Asset URLs carry the album share key in their query string, so anything that
+// reaches the user - a Notice, a console line, a message they paste into an
+// issue - has to have the query stripped off first.
+function withoutQuery(url: string): string {
+	const at = url.indexOf('?');
+	return at === -1 ? url : url.slice(0, at);
+}
+
+// Walks the three credentials in the order they are needed, so a failure points
+// at the one setting that is actually wrong: the URL and API key have to work
+// before the album ID is meaningful, and the album has to load before the share
+// key can be tried against an asset. Everything is reported through Notice -
+// requestUrl's status codes are already translated into actionable text by
+// describeHttpFailure, so there is nothing useful left for the console.
 async function testConnection(creds: ImmichCredentials) {
 	const url = new URL(creds.immichUrl + '/api/server/about');
-	console.log('[Immich] Testing connection to:', url.toString());
-	console.log('[Immich] API key configured:', creds.immichApiKey ? '✓ (present)' : '✗ (missing)');
-	
-	new Notice("Testing connection to " + url);
+	new Notice("Testing connection to " + url.toString());
 	try {
-		const startTime = Date.now();
-		const result = await immichRequest({
+		await immichRequest({
 			url: url.toString(),
 			headers: apiHeaders(creds)
 		}, 'contacting the server')
-		const duration = Date.now() - startTime;
-
-		console.log('[Immich] Connection response:', {
-			status: result.status,
-			statusText: result.status === 200 ? 'OK' : 'Error',
-			duration: `${duration}ms`,
-			headers: result.headers
-		});
-		
-		if (result.status == 200) {
-			console.log('[Immich] Server info:', result.json);
-			new Notice("Connection successful")
-		} else {
-			console.warn('[Immich] Unexpected status code:', result.status);
-		}
+		new Notice("Connection successful")
 	} catch(exception) {
-		console.error('[Immich] Connection failed:', {
-			url: url.toString(),
-			error: exception,
-			errorMessage: exception instanceof Error ? exception.message : String(exception),
-			settings: {
-				immichUrl: creds.immichUrl,
-				hasApiKey: !!creds.immichApiKey
-			}
-		});
 		new Notice("Failed to connect to " + creds.immichUrl + ". " + describeException(exception))
-	}	
+	}
+
 	const url2 = new URL(creds.immichUrl + '/api/albums/' + creds.immichAlbum);
-	console.log('[Immich] Testing album access with URL:', url2.toString());
 	let albumResult: RequestUrlResponse | null = null;
 	try {
-		const startTime = Date.now();
-		const result = await immichRequest({
+		albumResult = await immichRequest({
 			url: url2.toString(),
 			headers: apiHeaders(creds)
 		}, 'loading the album')
-		const duration = Date.now() - startTime;
-		
-		console.log('[Immich] Album access response:', {
-			status: result.status,
-			statusText: result.status === 200 ? 'OK' : 'Error',
-			duration: `${duration}ms`,
-			headers: result.headers
-		});
-		
-		if (result.status == 200) {
-			albumResult = result;
-			console.log('[Immich] Album info:', result.json);
-			new Notice("Album access successful - found " + result.json['assetCount'] + " assets.");
-		} else {
-			console.warn('[Immich] Unexpected status code when accessing album:', result.status);
-		}
+		new Notice("Album access successful - found " + albumResult.json['assetCount'] + " assets.");
 	} catch(exception) {
-		console.error('[Immich] Album access failed:', {
-			url: url2.toString(),
-			error: exception,
-			errorMessage: exception instanceof Error ? exception.message : String(exception),
-			settings: {
-				immichUrl: creds.immichUrl,
-				hasApiKey: !!creds.immichApiKey,
-				albumId: creds.immichAlbum
-			}
-		});
 		new Notice("Failed to access album. " + describeException(exception))
 	}
+
 	// If there is an item in the album, also test access to the first asset to verify that the album key is correct.
 	// Immich v3 no longer inlines the assets in the album response, so look them up separately when needed.
 	let firstAsset: ImmichAsset | null = null;
@@ -273,51 +235,24 @@ async function testConnection(creds: ImmichCredentials) {
 			const assets = await fetchAlbumAssets(creds, albumResult.json ?? {});
 			firstAsset = assets[0] ?? null;
 			if (assets.length === 0) {
-				console.log('[Immich] Album contains no assets - skipping asset access test.');
+				new Notice("Album is empty - skipping the album share key check.");
 			}
 		} catch (exception) {
-			console.error('[Immich] Failed to list album assets:', exception);
 			new Notice("Failed to list album assets. " + describeException(exception));
 		}
 	}
 	if (firstAsset) {
-		const assetId = firstAsset['id'];
-		const url3 = new URL(creds.immichUrl + '/api/assets/' + assetId + '/thumbnail?size=thumbnail&key=' + creds.immichAlbumKey);
-		console.log('[Immich] Testing asset access with URL:', url3.toString());
+		const url3 = new URL(creds.immichUrl + '/api/assets/' + firstAsset.id +
+			'/thumbnail?size=thumbnail&key=' + creds.immichAlbumKey);
 		try {
-			const startTime = Date.now();
-			const result = await immichRequest({
+			await immichRequest({
 				url: url3.toString(),
 				headers: apiHeaders(creds)
 			}, 'reading an asset thumbnail', 'share-key')
-			const duration = Date.now() - startTime;
-			
-			console.log('[Immich] Asset access response:', {
-				status: result.status,
-				statusText: result.status === 200 ? 'OK' : 'Error',
-				duration: `${duration}ms`,
-				headers: result.headers
-			});
-			
-			if (result.status == 200) {
-				console.log('[Immich] Asset access successful');
-				new Notice("Asset access successful - album key is correct.");
-			} else {
-				console.warn('[Immich] Unexpected status code when accessing asset:', result.status);
-			}
+			new Notice("Asset access successful - album key is correct.");
 		} catch(exception) {
-			console.error('[Immich] Asset access failed:', {
-				url: url3.toString(),
-				error: exception,
-				errorMessage: exception instanceof Error ? exception.message : String(exception),
-				settings: {
-					immichUrl: creds.immichUrl,
-					hasApiKey: !!creds.immichApiKey,
-					albumId: creds.immichAlbum,
-					albumKey: creds.immichAlbumKey
-				}
-			});
-			new Notice("Failed to access asset. " + describeException(exception) + " This may also indicate an issue with the album share key.");
+			new Notice("Failed to access " + withoutQuery(url3.toString()) + ". " + describeException(exception) +
+				" This may also indicate an issue with the album share key.");
 		}
 	}
 }
@@ -417,7 +352,6 @@ export default class ObsidianImmich extends Plugin {
 			callback: () => {
 				new Notice('Refreshing immich cache.');
 				refreshCacheFromImmich(this.credentials(), false).catch((error) => {
-					console.error('[Immich] Failed to refresh album cache:', error);
 					new Notice('Failed to refresh the immich album cache. ' + describeException(error));
 				});
 			}
@@ -531,7 +465,6 @@ class ImageSelectorModal extends Modal {
 			try {
 				await refreshCacheFromImmich(this.creds);
 			} catch (error) {
-				console.error('[Immich] Failed to load album:', error);
 				loading.setText('Failed to load the immich album. ' + describeException(error));
 				return;
 			}
@@ -584,7 +517,6 @@ class ImageSelectorModal extends Modal {
 				this.onClose();
 				await this.onOpen();
 			} catch (error) {
-				console.error('[Immich] Refresh failed:', error);
 				new Notice('Failed to refresh cache. ' + describeException(error));
 				refresh.disabled = false;
 				refresh.setText('Refresh');
