@@ -251,3 +251,13 @@
 .obsidian-immich-migration-notice p {
     color: var(--text-muted);
 }
+
+.obsidian-immich-setting-error {
+    display: none;
+    padding-top: 4px;
+    color: var(--text-error);
+}
+
+.obsidian-immich-setting-error.is-visible {
+    display: block;
+}

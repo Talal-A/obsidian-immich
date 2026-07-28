@@ -82,6 +82,28 @@ function normalizeImmichUrl(value: string): string {
 	return value.trim().replace(/\/+$/, '');
 }
 
+// This one setting decides where the API key gets sent, and the value is also
+// used as an <img> src and written into the user's notes, so anything that is
+// not a plain http(s) origin is rejected rather than carried through to those
+// sinks. Returns the problem to show the user, or null when the URL is usable.
+function immichUrlProblem(value: string): string | null {
+	if (!value) {
+		return 'The Immich URL is not set.';
+	}
+	let parsed: URL;
+	try {
+		parsed = new URL(value);
+	} catch {
+		// Left unparsed this surfaces later as a bare TypeError from whichever
+		// request happened to be built first.
+		return 'The Immich URL is not a valid URL. It should look like https://immich.example.com.';
+	}
+	if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+		return 'The Immich URL must start with http:// or https://.';
+	}
+	return null;
+}
+
 // The setup instructions have the user copy a share URL and pick the key out of
 // it, so the whole URL routinely ends up stored instead. Immich then receives a
 // URL where it expects a token and answers 401, which is an unhelpful way to
@@ -203,6 +225,12 @@ function withoutQuery(url: string): string {
 // requestUrl's status codes are already translated into actionable text by
 // describeHttpFailure, so there is nothing useful left for the console.
 async function testConnection(creds: ImmichCredentials) {
+	const urlProblem = immichUrlProblem(creds.immichUrl);
+	if (urlProblem) {
+		new Notice(urlProblem);
+		return;
+	}
+
 	const url = new URL(creds.immichUrl + '/api/server/about');
 	new Notice("Testing connection to " + url.toString());
 	try {
@@ -308,7 +336,11 @@ async function fetchAlbumAssets(creds: ImmichCredentials, album: Record<string, 
 async function refreshCacheFromImmich(creds: ImmichCredentials, silent=true) {
 	// A missing secret usually means the keychain entry was deleted or renamed,
 	// which is worth saying plainly rather than sending an unauthenticated call.
-	if (!creds.immichUrl || !creds.immichAlbum || !creds.immichApiKey) {
+	const urlProblem = immichUrlProblem(creds.immichUrl);
+	if (urlProblem) {
+		throw new Error(urlProblem);
+	}
+	if (!creds.immichAlbum || !creds.immichApiKey) {
 		throw new Error('Immich URL, album ID, and API key must all be configured in the plugin settings.');
 	}
 
@@ -749,15 +781,26 @@ class SettingTab extends PluginSettingTab {
 
 		this.displayMigrationNotice(containerEl);
 
-		new Setting(containerEl)
+		const urlSetting = new Setting(containerEl)
 			.setName('Immich URL')
-			.setDesc('Full URL to your immich instance.')
-			.addText(text => text
-				.setValue(this.plugin.settings.immichUrl)
-				.onChange(async (value) => {
-					this.plugin.settings.immichUrl = normalizeImmichUrl(value);
-					await this.plugin.saveSettings();
-				}));
+			.setDesc('Full URL to your immich instance.');
+		// Said here rather than on the next failed request, which would report it
+		// as a connection problem and send the user looking at the wrong setting.
+		const urlProblemEl = urlSetting.descEl.createDiv({cls: 'obsidian-immich-setting-error'});
+		const showUrlProblem = (value: string) => {
+			// Nothing to complain about while the field is simply still empty.
+			const problem = value ? immichUrlProblem(value) : null;
+			urlProblemEl.setText(problem ?? '');
+			urlProblemEl.toggleClass('is-visible', problem !== null);
+		};
+		urlSetting.addText(text => text
+			.setValue(this.plugin.settings.immichUrl)
+			.onChange(async (value) => {
+				this.plugin.settings.immichUrl = normalizeImmichUrl(value);
+				showUrlProblem(this.plugin.settings.immichUrl);
+				await this.plugin.saveSettings();
+			}));
+		showUrlProblem(this.plugin.settings.immichUrl);
 		new Setting(containerEl)
 			.setName('Immich API key')
 			.setDesc('Stored in Obsidian\'s keychain. Obtained from {IMMICH_URL}/user-settings?isOpen=api-keys.')
