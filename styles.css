@@ -2,8 +2,8 @@
    The picker needs room to show a scannable grid; the default modal width
    leaves two thumbnails per row. */
 .obsidian-immich-modal {
-    width: min(880px, 90vw);
-    max-width: min(880px, 90vw);
+    width: min(1040px, 92vw);
+    max-width: min(1040px, 92vw);
 }
 
 .obsidian-immich-picker {
@@ -86,20 +86,21 @@
     font-weight: var(--font-medium);
 }
 
-/* ---- grid ----------------------------------------------------------------
-   auto-fill + 1fr gives every tile the same footprint, so the layout cannot
-   develop the ragged column gaps the old two-column flex produced. */
+/* ---- masonry grid --------------------------------------------------------
+   Photos keep their real aspect ratio, so tiles have unequal heights. CSS
+   multi-column balances the columns on its own, which is what the original
+   hand-assigned two-column flex could not do - that is where the ragged dead
+   space came from. `break-inside: avoid` keeps a tile whole. */
 .obsidian-immich-scroll {
     overflow-y: auto;
-    max-height: min(60vh, 520px);
+    max-height: min(64vh, 600px);
     margin: 0 -4px;
     padding: 0 4px;
 }
 
 .obsidian-immich-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
-    gap: 8px;
+    column-width: 210px;
+    column-gap: 10px;
 }
 
 .obsidian-immich-sentinel {
@@ -111,24 +112,27 @@
     position: relative;
     display: block;
     width: 100%;
-    aspect-ratio: 1 / 1;
+    /* Never split a photo across a column boundary. */
+    break-inside: avoid;
+    -webkit-column-break-inside: avoid;
+    margin: 0 0 10px;
     padding: 0;
     overflow: hidden;
     border-radius: var(--radius-m);
     background-color: var(--background-secondary);
     box-shadow: none;
     cursor: pointer;
-    /* Selection ring is drawn inside the tile so it never shifts the grid. */
+    /* Selection ring is drawn inside the tile so it never shifts the layout. */
     outline: 2px solid transparent;
     outline-offset: -2px;
-    transition: outline-color 120ms ease, transform 120ms ease;
+    transition: outline-color 120ms ease;
 }
 
 .obsidian-immich-tile img {
     width: 100%;
-    height: 100%;
-    /* Uniform crop: the grid stays even regardless of source aspect ratio. */
-    object-fit: cover;
+    /* Height follows the image's own ratio - no cropping. The inline
+       aspect-ratio reserves the shape before the thumbnail arrives. */
+    height: auto;
     display: block;
 }
 
@@ -145,14 +149,14 @@
 }
 
 .obsidian-immich-tile.is-selected img {
-    transform: scale(0.94);
-    border-radius: var(--radius-m);
+    opacity: 0.82;
 }
 
 .obsidian-immich-tile.is-broken {
     display: flex;
     align-items: center;
     justify-content: center;
+    min-height: 90px;
     font-size: var(--font-ui-smaller);
     color: var(--text-error);
 }

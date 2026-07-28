@@ -42,6 +42,10 @@ interface ImmichAsset {
 	// matched as text, so there is no reason to parse it.
 	taken: string;
 	place: string;
+	// Native pixel dimensions, 0 when Immich does not report them. Used only to
+	// reserve the right shape before the thumbnail loads.
+	width: number;
+	height: number;
 }
 
 // Immich returns a large asset object; keep only what the picker displays or
@@ -54,7 +58,9 @@ function toImmichAsset(raw: Record<string, unknown>): ImmichAsset {
 		type: String(raw['type'] ?? ''),
 		fileName: String(raw['originalFileName'] ?? ''),
 		taken: String(raw['localDateTime'] ?? raw['fileCreatedAt'] ?? ''),
-		place: place
+		place: place,
+		width: Number(raw['width'] ?? exif['exifImageWidth'] ?? 0) || 0,
+		height: Number(raw['height'] ?? exif['exifImageHeight'] ?? 0) || 0
 	};
 }
 
@@ -692,13 +698,29 @@ class ImageSelectorModal extends Modal {
 		// rather than offering a tile that does nothing.
 		if (insertionText === null) return;
 
-		const tile = grid.createEl('button', {cls: 'obsidian-immich-tile'});
-		tile.setAttribute('type', 'button');
-		tile.toggleClass('is-selected', this.selection.includes(asset.id));
+		// A div rather than a button: Obsidian's own button styling imposes a
+		// control height that collapses the tile regardless of aspect-ratio.
+		const tile = grid.createDiv({cls: 'obsidian-immich-tile'});
+		const selected = this.selection.includes(asset.id);
+		tile.toggleClass('is-selected', selected);
+		tile.setAttribute('role', 'button');
+		tile.setAttribute('tabindex', '0');
+		tile.setAttribute('aria-pressed', String(selected));
 		tile.setAttribute('aria-label', asset.fileName || 'Immich asset');
 
 		const img = tile.createEl('img', {attr: {loading: 'lazy', decoding: 'async', alt: ''}});
+		// Reserve the correct shape up front so the masonry columns do not jump
+		// as thumbnails arrive. Immich's dimensions are a hint; the loaded image
+		// is authoritative, which also sidesteps EXIF orientation differences.
+		if (asset.width > 0 && asset.height > 0) {
+			img.style.aspectRatio = asset.width + ' / ' + asset.height;
+		}
 		img.src = this.assetUrl(asset) + '/thumbnail?size=thumbnail&key=' + this.creds.immichAlbumKey;
+		img.onload = () => {
+			if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+				img.style.aspectRatio = img.naturalWidth + ' / ' + img.naturalHeight;
+			}
+		};
 		img.onerror = () => {
 			tile.addClass('is-broken');
 			tile.setText('Failed to load');
@@ -714,7 +736,7 @@ class ImageSelectorModal extends Modal {
 		caption.setAttribute('title', [asset.fileName, asset.place, asset.taken.slice(0, 10)]
 			.filter(Boolean).join(' · '));
 
-		tile.onclick = () => {
+		const toggle = () => {
 			const at = this.selection.indexOf(asset.id);
 			if (at === -1) {
 				this.selection.push(asset.id);
@@ -723,8 +745,18 @@ class ImageSelectorModal extends Modal {
 				this.selection.splice(at, 1);
 				tile.removeClass('is-selected');
 			}
+			tile.setAttribute('aria-pressed', String(at === -1));
 			this.updateStatus();
 		};
+
+		tile.onclick = toggle;
+		// The tile is not a real button, so it has to answer the keys one would.
+		tile.addEventListener('keydown', (event: KeyboardEvent) => {
+			if (event.key === 'Enter' || event.key === ' ') {
+				event.preventDefault();
+				toggle();
+			}
+		});
 	}
 
 	private assetUrl(asset: ImmichAsset): string {
