@@ -5,22 +5,39 @@ on:
     tags:
       - "*"
 
+permissions:
+  contents: write
+  # Both are needed to sign the build provenance attestation.
+  id-token: write
+  attestations: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Use Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: "18.x"
+          node-version: "20.x"
 
       - name: Build plugin
         run: |
-          npm install
+          npm ci
           npm run build
+
+      # Signed proof that these files came out of this workflow, from this
+      # commit. Rebuilding from source already lets someone check a release by
+      # hand; this makes the same claim verifiable without doing so.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
 
       - name: Create release
         env:

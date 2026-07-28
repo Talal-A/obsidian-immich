@@ -1,74 +1,293 @@
+/* ---- modal shell ---------------------------------------------------------
+   The picker needs room to show a scannable grid; the default modal width
+   leaves two thumbnails per row. */
+.obsidian-immich-modal {
+    width: min(1040px, 92vw);
+    max-width: min(1040px, 92vw);
+}
+
+.obsidian-immich-picker {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-height: 0;
+    padding-top: 4px;
+}
+
+/* ---- header -------------------------------------------------------------- */
 .obsidian-immich-header {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--background-modifier-border);
-    margin-bottom: 12px;
     gap: 12px;
 }
 
+.obsidian-immich-titles {
+    min-width: 0;
+}
+
 .obsidian-immich-title {
-    font-size: 16px;
-    font-weight: 600;
-    flex: 1;
+    font-size: var(--font-ui-large);
+    font-weight: var(--font-semibold);
+    line-height: 1.2;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-.obsidian-immich-refresh-button {
-    padding: 6px 12px;
-    border-radius: 4px;
-    background-color: var(--interactive-normal);
-    border: none;
-    cursor: pointer;
-    font-size: 14px;
-    transition: background-color 0.2s;
+/* Live count of what is shown and what is selected - the picker's status line. */
+.obsidian-immich-subtitle {
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
+    margin-top: 2px;
 }
 
-.obsidian-immich-refresh-button:hover {
-    background-color: var(--interactive-hover);
+.obsidian-immich-refresh {
+    flex: none;
 }
 
-.obsidian-immich-refresh-button:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
-
-.obsidian-immich-scroll-container {
-    overflow-y: auto;
-}
-
-.obsidian-immich-row {
+/* ---- toolbar ------------------------------------------------------------- */
+.obsidian-immich-toolbar {
     display: flex;
-}
-
-.obsidian-immich-column {
-    flex: 1;
-    min-width: 0;
-}
-
-.obsidian-immich-column-content {
-    display: flex;
-    flex-direction: column;
+    align-items: center;
     gap: 8px;
+    flex-wrap: wrap;
+}
+
+.obsidian-immich-search {
+    flex: 1;
+    min-width: 180px;
+}
+
+.obsidian-immich-filters,
+.obsidian-immich-mode {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    border-radius: var(--radius-m);
+    background-color: var(--background-modifier-form-field);
+}
+
+/* Pushes the mode toggle to the left of the flex-end footer. */
+.obsidian-immich-mode {
+    margin-right: auto;
+}
+
+.obsidian-immich-filter,
+.obsidian-immich-mode-option {
+    box-shadow: none;
+    background-color: transparent;
+    padding: 4px 12px;
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
+    cursor: pointer;
+}
+
+.obsidian-immich-filter:hover,
+.obsidian-immich-mode-option:hover {
+    color: var(--text-normal);
+}
+
+.obsidian-immich-filter.is-active,
+.obsidian-immich-mode-option.is-active {
+    background-color: var(--background-primary);
+    color: var(--text-normal);
+    font-weight: var(--font-medium);
+}
+
+/* ---- masonry grid --------------------------------------------------------
+   Photos keep their real aspect ratio, so tiles have unequal heights. CSS
+   multi-column balances the columns on its own, which is what the original
+   hand-assigned two-column flex could not do - that is where the ragged dead
+   space came from. `break-inside: avoid` keeps a tile whole. */
+.obsidian-immich-scroll {
+    overflow-y: auto;
+    max-height: min(64vh, 600px);
+    margin: 0 -4px;
     padding: 0 4px;
 }
 
-.obsidian-immich-overallDiv {
-    position: relative;
+.obsidian-immich-grid {
+    column-width: 210px;
+    column-gap: 10px;
 }
 
-.obsidian-immich-overallDiv img,
-.obsidian-immich-overallDiv video {
+.obsidian-immich-sentinel {
+    height: 1px;
+}
+
+/* ---- tile ---------------------------------------------------------------- */
+.obsidian-immich-tile {
+    position: relative;
+    display: block;
     width: 100%;
+    /* Never split a photo across a column boundary. */
+    break-inside: avoid;
+    -webkit-column-break-inside: avoid;
+    margin: 0 0 10px;
+    padding: 0;
+    overflow: hidden;
+    border-radius: var(--radius-m);
+    background-color: var(--background-secondary);
+    box-shadow: none;
+    cursor: pointer;
+    /* Selection ring is drawn inside the tile so it never shifts the layout. */
+    outline: 2px solid transparent;
+    outline-offset: -2px;
+    transition: outline-color 120ms ease;
+}
+
+.obsidian-immich-tile img {
+    width: 100%;
+    /* Height follows the image's own ratio - no cropping. The inline
+       aspect-ratio reserves the shape before the thumbnail arrives. */
     height: auto;
     display: block;
 }
 
-.obsidian-immich-loading {
-    text-align: center;
-    padding: 16px;
+.obsidian-immich-tile:hover {
+    outline-color: var(--background-modifier-border-hover);
+}
+
+.obsidian-immich-tile:focus-visible {
+    outline-color: var(--interactive-accent);
+}
+
+.obsidian-immich-tile.is-selected {
+    outline-color: var(--interactive-accent);
+}
+
+.obsidian-immich-tile.is-selected img {
+    opacity: 0.82;
+}
+
+.obsidian-immich-tile.is-broken {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 90px;
+    font-size: var(--font-ui-smaller);
+    color: var(--text-error);
+}
+
+/* Selection checkmark, revealed only once the tile is chosen. */
+.obsidian-immich-check {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     font-size: 12px;
+    line-height: 1;
+    color: var(--text-on-accent);
+    background-color: var(--interactive-accent);
+    opacity: 0;
+    transform: scale(0.6);
+    transition: opacity 120ms ease, transform 120ms ease;
+}
+
+.obsidian-immich-tile.is-selected .obsidian-immich-check {
+    opacity: 1;
+    transform: scale(1);
+}
+
+/* Videos behave differently once inserted, so mark them up front. */
+.obsidian-immich-badge {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    padding: 1px 6px;
+    border-radius: var(--radius-s);
+    font-size: var(--font-ui-smaller);
+    color: var(--text-on-accent);
+    background-color: rgba(0, 0, 0, 0.6);
+}
+
+.obsidian-immich-caption {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 14px 6px 4px;
+    font-size: var(--font-ui-smaller);
+    text-align: left;
+    color: #fff;
+    background: linear-gradient(to top, rgba(0, 0, 0, 0.75), transparent);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0;
+    transition: opacity 120ms ease;
+}
+
+.obsidian-immich-tile:hover .obsidian-immich-caption,
+.obsidian-immich-tile:focus-visible .obsidian-immich-caption {
+    opacity: 1;
+}
+
+/* ---- footer -------------------------------------------------------------- */
+.obsidian-immich-footer {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    padding-top: 4px;
+    border-top: 1px solid var(--background-modifier-border);
+}
+
+.obsidian-immich-insert:disabled,
+.obsidian-immich-clear:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Cancel only exists while a download is running. */
+.obsidian-immich-cancel {
+    display: none;
+}
+
+.obsidian-immich-picker.is-importing .obsidian-immich-cancel {
+    display: inline-flex;
+}
+
+/* Nothing in the grid or toolbar should be clickable mid-import. */
+.obsidian-immich-picker.is-importing .obsidian-immich-scroll,
+.obsidian-immich-picker.is-importing .obsidian-immich-toolbar,
+.obsidian-immich-picker.is-importing .obsidian-immich-mode {
+    opacity: 0.5;
+    pointer-events: none;
+}
+
+/* ---- empty states -------------------------------------------------------- */
+.obsidian-immich-empty,
+.obsidian-immich-noresults {
+    padding: 24px 16px;
+    text-align: center;
+    color: var(--text-muted);
+}
+
+/* ---- settings ------------------------------------------------------------ */
+.obsidian-immich-migration-notice {
+    border: 1px solid var(--background-modifier-error);
+    border-radius: var(--radius-m);
+    padding: 0 16px;
+    margin-bottom: 18px;
+}
+
+.obsidian-immich-migration-notice p {
+    color: var(--text-muted);
+}
+
+.obsidian-immich-setting-error {
+    display: none;
+    padding-top: 4px;
+    color: var(--text-error);
+}
+
+.obsidian-immich-setting-error.is-visible {
+    display: block;
 }
