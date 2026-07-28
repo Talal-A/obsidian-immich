@@ -8,6 +8,30 @@ This plugin allows users to easily insert images from their self-hosted Immich i
 
 Your API key and album share key are stored in Obsidian's keychain, which encrypts them at rest using your operating system's credential store (macOS Keychain, Windows DPAPI, or a Linux secret store such as gnome-keyring). They are never written to the vault's `data.json`; only the name of the keychain entry is. You can review and revoke them at any time under **Settings → Keychain**.
 
+### The share key is written into your notes
+
+**Read this before sharing or publishing a note that contains an Immich image.**
+
+Images and videos are hot-linked from your Immich instance rather than downloaded, and the link has to carry the album share key in order to load:
+
+```markdown
+![](<https://your-immich-url.com/api/assets/{id}/thumbnail?size=preview&key=SHARE_KEY>)
+```
+
+So the key ends up in the note itself. That matters because the share key grants read access to the **entire** shared album, not just the one image it appears next to. In practice it means:
+
+- **Publishing a note publishes the key.** Obsidian Publish, a blog export, a public repository — anyone who reads the page can extract it and browse the whole album.
+- **Syncing your vault to git stores the key in history**, permanently. Rotating the key afterwards does not remove it from past commits.
+- **Sharing a note shares album-wide access**, not per-image access.
+
+The practical mitigations today:
+
+- Keep the `obsidian` album limited to photos you would not mind seeing shared, and keep everything else in other albums. This is the reason the setup instructions suggest a dedicated album.
+- Keep your Immich instance off the public internet if you can. The key is only useful to someone who can reach the server.
+- Rotate the share key in Immich if a note containing it has been published. Existing notes will stop rendering and need re-inserting.
+
+This is a known design limitation, not a bug — see [issue #2](https://github.com/tuttopassastudios/obsidian-immich/issues/2), which tracks the options for removing the credential from note content.
+
 ## Features
 
 - Browse a shared Immich album in a masonry grid that keeps each photo's own aspect ratio.
@@ -51,7 +75,9 @@ https://github.com/user-attachments/assets/5ade12f7-c959-4991-9d6b-54bcb9569050
     - Immich API key: click "Link", then add the key you generated in step 5 as a keychain entry.
     - Immich Album ID: the UUID you obtained in step 2.
     - Immich Album Share Key: click "Link", then add the Key you obtained in step 4 as a keychain entry.
-8. Click "Test connection" to confirm connectivity. If any errors appear, you can view them in the console. Open the console using `cmd+option+i` (MacOS) or `ctrl+shift+i` (Windows). 
+8. Click "Test connection" to confirm connectivity.
+
+"Test connection" checks the three credentials in the order they are needed — the URL and API key first, then the album ID, then the share key against a real asset — and reports each result as a notice. A failure names the setting that caused it, so there is no need to open the developer console; the plugin deliberately does not log anything there, because the share key would otherwise end up in console output that users paste into bug reports.
 
 ### Upgrading from 0.3.0 or earlier
 

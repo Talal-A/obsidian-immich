@@ -79,20 +79,35 @@ interface ImmichAsset {
 	mimeType: string;
 }
 
+// Every field below comes off the wire, so a value that is not a string is a
+// server that does not match what this plugin expects. Coercing it with String()
+// would quietly produce "[object Object]" and put that in a filename or a URL.
+function asText(value: unknown): string {
+	if (typeof value === 'string') return value;
+	if (typeof value === 'number') return String(value);
+	return '';
+}
+
+// Narrows a JSON body to something indexable. requestUrl types `json` as `any`,
+// which spreads untyped values through everything that touches a response.
+function asObject(value: unknown): Record<string, unknown> {
+	return typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
+}
+
 // Immich returns a large asset object; keep only what the picker displays or
 // searches on, since the whole album is held in memory.
 function toImmichAsset(raw: Record<string, unknown>): ImmichAsset {
-	const exif = (raw['exifInfo'] ?? {}) as Record<string, unknown>;
-	const place = [exif['city'], exif['country']].filter(Boolean).join(', ');
+	const exif = asObject(raw['exifInfo']);
+	const place = [exif['city'], exif['country']].map(asText).filter(Boolean).join(', ');
 	return {
-		id: String(raw['id'] ?? ''),
-		type: String(raw['type'] ?? ''),
-		fileName: String(raw['originalFileName'] ?? ''),
-		taken: String(raw['localDateTime'] ?? raw['fileCreatedAt'] ?? ''),
+		id: asText(raw['id']),
+		type: asText(raw['type']),
+		fileName: asText(raw['originalFileName']),
+		taken: asText(raw['localDateTime']) || asText(raw['fileCreatedAt']),
 		place: place,
 		width: Number(raw['width'] ?? exif['exifImageWidth'] ?? 0) || 0,
 		height: Number(raw['height'] ?? exif['exifImageHeight'] ?? 0) || 0,
-		mimeType: String(raw['originalMimeType'] ?? '')
+		mimeType: asText(raw['originalMimeType'])
 	};
 }
 
@@ -118,6 +133,28 @@ let cachedResult: AlbumCache | null = null;
 
 function normalizeImmichUrl(value: string): string {
 	return value.trim().replace(/\/+$/, '');
+}
+
+// This one setting decides where the API key gets sent, and the value is also
+// used as an <img> src and written into the user's notes, so anything that is
+// not a plain http(s) origin is rejected rather than carried through to those
+// sinks. Returns the problem to show the user, or null when the URL is usable.
+function immichUrlProblem(value: string): string | null {
+	if (!value) {
+		return 'The Immich URL is not set.';
+	}
+	let parsed: URL;
+	try {
+		parsed = new URL(value);
+	} catch {
+		// Left unparsed this surfaces later as a bare TypeError from whichever
+		// request happened to be built first.
+		return 'The Immich URL is not a valid URL. It should look like https://immich.example.com.';
+	}
+	if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+		return 'The Immich URL must start with http:// or https://.';
+	}
+	return null;
 }
 
 // The setup instructions have the user copy a share URL and pick the key out of
@@ -243,136 +280,84 @@ function describeException(exception: unknown): string {
 	return exception instanceof Error ? exception.message : String(exception);
 }
 
+// Asset URLs carry the album share key in their query string, so anything that
+// reaches the user - a Notice, a console line, a message they paste into an
+// issue - has to have the query stripped off first.
+function withoutQuery(url: string): string {
+	const at = url.indexOf('?');
+	return at === -1 ? url : url.slice(0, at);
+}
+
+// Videos are inserted as an HTML tag, so anything interpolated into an
+// attribute has to be unable to close it.
+function escapeAttribute(value: string): string {
+	return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Walks the three credentials in the order they are needed, so a failure points
+// at the one setting that is actually wrong: the URL and API key have to work
+// before the album ID is meaningful, and the album has to load before the share
+// key can be tried against an asset. Everything is reported through Notice -
+// requestUrl's status codes are already translated into actionable text by
+// describeHttpFailure, so there is nothing useful left for the console.
 async function testConnection(creds: ImmichCredentials) {
+	const urlProblem = immichUrlProblem(creds.immichUrl);
+	if (urlProblem) {
+		new Notice(urlProblem);
+		return;
+	}
+
 	const url = new URL(creds.immichUrl + '/api/server/about');
-	console.log('[Immich] Testing connection to:', url.toString());
-	console.log('[Immich] API key configured:', creds.immichApiKey ? '✓ (present)' : '✗ (missing)');
-	
-	new Notice("Testing connection to " + url);
+	new Notice("Testing connection to " + url.toString());
 	try {
-		const startTime = Date.now();
-		const result = await immichRequest({
+		await immichRequest({
 			url: url.toString(),
 			headers: apiHeaders(creds)
 		}, 'contacting the server')
-		const duration = Date.now() - startTime;
-
-		console.log('[Immich] Connection response:', {
-			status: result.status,
-			statusText: result.status === 200 ? 'OK' : 'Error',
-			duration: `${duration}ms`,
-			headers: result.headers
-		});
-		
-		if (result.status == 200) {
-			console.log('[Immich] Server info:', result.json);
-			new Notice("Connection successful")
-		} else {
-			console.warn('[Immich] Unexpected status code:', result.status);
-		}
+		new Notice("Connection successful")
 	} catch(exception) {
-		console.error('[Immich] Connection failed:', {
-			url: url.toString(),
-			error: exception,
-			errorMessage: exception instanceof Error ? exception.message : String(exception),
-			settings: {
-				immichUrl: creds.immichUrl,
-				hasApiKey: !!creds.immichApiKey
-			}
-		});
 		new Notice("Failed to connect to " + creds.immichUrl + ". " + describeException(exception))
-	}	
+	}
+
 	const url2 = new URL(creds.immichUrl + '/api/albums/' + creds.immichAlbum);
-	console.log('[Immich] Testing album access with URL:', url2.toString());
-	let albumResult: RequestUrlResponse | null = null;
+	let album: Record<string, unknown> | null = null;
 	try {
-		const startTime = Date.now();
 		const result = await immichRequest({
 			url: url2.toString(),
 			headers: apiHeaders(creds)
 		}, 'loading the album')
-		const duration = Date.now() - startTime;
-		
-		console.log('[Immich] Album access response:', {
-			status: result.status,
-			statusText: result.status === 200 ? 'OK' : 'Error',
-			duration: `${duration}ms`,
-			headers: result.headers
-		});
-		
-		if (result.status == 200) {
-			albumResult = result;
-			console.log('[Immich] Album info:', result.json);
-			new Notice("Album access successful - found " + result.json['assetCount'] + " assets.");
-		} else {
-			console.warn('[Immich] Unexpected status code when accessing album:', result.status);
-		}
+		album = asObject(result.json);
+		new Notice("Album access successful - found " + asText(album['assetCount']) + " assets.");
 	} catch(exception) {
-		console.error('[Immich] Album access failed:', {
-			url: url2.toString(),
-			error: exception,
-			errorMessage: exception instanceof Error ? exception.message : String(exception),
-			settings: {
-				immichUrl: creds.immichUrl,
-				hasApiKey: !!creds.immichApiKey,
-				albumId: creds.immichAlbum
-			}
-		});
 		new Notice("Failed to access album. " + describeException(exception))
 	}
+
 	// If there is an item in the album, also test access to the first asset to verify that the album key is correct.
 	// Immich v3 no longer inlines the assets in the album response, so look them up separately when needed.
 	let firstAsset: ImmichAsset | null = null;
-	if (albumResult) {
+	if (album) {
 		try {
-			const assets = await fetchAlbumAssets(creds, albumResult.json ?? {});
+			const assets = await fetchAlbumAssets(creds, album);
 			firstAsset = assets[0] ?? null;
 			if (assets.length === 0) {
-				console.log('[Immich] Album contains no assets - skipping asset access test.');
+				new Notice("Album is empty - skipping the album share key check.");
 			}
 		} catch (exception) {
-			console.error('[Immich] Failed to list album assets:', exception);
 			new Notice("Failed to list album assets. " + describeException(exception));
 		}
 	}
 	if (firstAsset) {
-		const assetId = firstAsset['id'];
-		const url3 = new URL(creds.immichUrl + '/api/assets/' + assetId + '/thumbnail?size=thumbnail&key=' + creds.immichAlbumKey);
-		console.log('[Immich] Testing asset access with URL:', url3.toString());
+		const url3 = new URL(creds.immichUrl + '/api/assets/' + firstAsset.id +
+			'/thumbnail?size=thumbnail&key=' + creds.immichAlbumKey);
 		try {
-			const startTime = Date.now();
-			const result = await immichRequest({
+			await immichRequest({
 				url: url3.toString(),
 				headers: apiHeaders(creds)
 			}, 'reading an asset thumbnail', 'share-key')
-			const duration = Date.now() - startTime;
-			
-			console.log('[Immich] Asset access response:', {
-				status: result.status,
-				statusText: result.status === 200 ? 'OK' : 'Error',
-				duration: `${duration}ms`,
-				headers: result.headers
-			});
-			
-			if (result.status == 200) {
-				console.log('[Immich] Asset access successful');
-				new Notice("Asset access successful - album key is correct.");
-			} else {
-				console.warn('[Immich] Unexpected status code when accessing asset:', result.status);
-			}
+			new Notice("Asset access successful - album key is correct.");
 		} catch(exception) {
-			console.error('[Immich] Asset access failed:', {
-				url: url3.toString(),
-				error: exception,
-				errorMessage: exception instanceof Error ? exception.message : String(exception),
-				settings: {
-					immichUrl: creds.immichUrl,
-					hasApiKey: !!creds.immichApiKey,
-					albumId: creds.immichAlbum,
-					albumKey: creds.immichAlbumKey
-				}
-			});
-			new Notice("Failed to access asset. " + describeException(exception) + " This may also indicate an issue with the album share key.");
+			new Notice("Failed to access " + withoutQuery(url3.toString()) + ". " + describeException(exception) +
+				" This may also indicate an issue with the album share key.");
 		}
 	}
 }
@@ -383,7 +368,7 @@ async function testConnection(creds: ImmichCredentials) {
 async function fetchAlbumAssets(creds: ImmichCredentials, album: Record<string, unknown>): Promise<ImmichAsset[]> {
 	const inlined = album['assets'];
 	if (Array.isArray(inlined)) {
-		return inlined.map(toImmichAsset);
+		return inlined.map(entry => toImmichAsset(asObject(entry)));
 	}
 
 	const url = new URL(creds.immichUrl + '/api/search/metadata');
@@ -408,11 +393,12 @@ async function fetchAlbumAssets(creds: ImmichCredentials, album: Record<string, 
 			})
 		}, 'listing the album\'s assets');
 
-		const searchAssets = result.json?.['assets'];
-		const items: Record<string, unknown>[] = searchAssets?.['items'] ?? [];
-		assets.push(...items.map(toImmichAsset));
+		const searchAssets = asObject(asObject(result.json)['assets']);
+		const rawItems = searchAssets['items'];
+		const items = Array.isArray(rawItems) ? rawItems : [];
+		assets.push(...items.map(entry => toImmichAsset(asObject(entry))));
 
-		const nextPage = Number(searchAssets?.['nextPage']);
+		const nextPage = Number(searchAssets['nextPage']);
 		page = Number.isFinite(nextPage) && nextPage > page ? nextPage : 0;
 
 		// Defensive stop: a server that keeps handing back a next page would
@@ -431,6 +417,11 @@ async function fetchAlbumAssets(creds: ImmichCredentials, album: Record<string, 
 const SMART_SEARCH_LIMIT = 250;
 
 async function smartSearch(creds: ImmichCredentials, query: string, type: string): Promise<ImmichAsset[]> {
+	// Same guard as the album fetch: never build a request - or send the API
+	// key - from a URL that is not a plain http(s) origin.
+	const urlProblem = immichUrlProblem(creds.immichUrl);
+	if (urlProblem) throw new Error(urlProblem);
+
 	const body: Record<string, unknown> = {
 		query: query,
 		albumIds: [creds.immichAlbum],
@@ -449,14 +440,20 @@ async function smartSearch(creds: ImmichCredentials, query: string, type: string
 		body: JSON.stringify(body)
 	}, 'running a smart search');
 
-	const items: Record<string, unknown>[] = result.json?.['assets']?.['items'] ?? [];
-	return items.map(toImmichAsset);
+	const searchAssets = asObject(asObject(result.json)['assets']);
+	const rawItems = searchAssets['items'];
+	const items = Array.isArray(rawItems) ? rawItems : [];
+	return items.map(entry => toImmichAsset(asObject(entry)));
 }
 
 async function refreshCacheFromImmich(creds: ImmichCredentials, silent=true) {
 	// A missing secret usually means the keychain entry was deleted or renamed,
 	// which is worth saying plainly rather than sending an unauthenticated call.
-	if (!creds.immichUrl || !creds.immichAlbum || !creds.immichApiKey) {
+	const urlProblem = immichUrlProblem(creds.immichUrl);
+	if (urlProblem) {
+		throw new Error(urlProblem);
+	}
+	if (!creds.immichAlbum || !creds.immichApiKey) {
 		throw new Error('Immich URL, album ID, and API key must all be configured in the plugin settings.');
 	}
 
@@ -466,11 +463,11 @@ async function refreshCacheFromImmich(creds: ImmichCredentials, silent=true) {
 		headers: apiHeaders(creds)
 	}, 'loading the album');
 
-	const album = result.json ?? {};
+	const album = asObject(result.json);
 	const assets = await fetchAlbumAssets(creds, album);
 
 	cachedResult = {
-		albumName: album['albumName'] ?? '',
+		albumName: asText(album['albumName']),
 		assets: assets,
 		fingerprint: credentialsFingerprint(creds)
 	};
@@ -503,7 +500,6 @@ export default class ObsidianImmich extends Plugin {
 			callback: () => {
 				new Notice('Refreshing immich cache.');
 				refreshCacheFromImmich(this.credentials(), false).catch((error) => {
-					console.error('[Immich] Failed to refresh album cache:', error);
 					new Notice('Failed to refresh the immich album cache. ' + describeException(error));
 				});
 			}
@@ -533,7 +529,7 @@ export default class ObsidianImmich extends Plugin {
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, asObject(await this.loadData()));
 		this.settings.immichUrl = normalizeImmichUrl(this.settings.immichUrl);
 		// data.json is user-editable, so the numeric settings are re-clamped
 		// rather than trusted.
@@ -701,6 +697,9 @@ interface FetchedAsset {
 }
 
 async function fetchAssetBytes(creds: ImmichCredentials, asset: ImmichAsset, size: RenditionSize): Promise<FetchedAsset> {
+	const urlProblem = immichUrlProblem(creds.immichUrl);
+	if (urlProblem) throw new Error(urlProblem);
+
 	const attempt = async (which: RenditionSize): Promise<FetchedAsset> => {
 		const result = await immichRequest({
 			url: assetMediaUrl(creds, asset, which),
@@ -784,7 +783,7 @@ async function reencodeImage(
 		const encoded = await canvasToArrayBuffer(canvas, quality);
 		return encoded ? {data: encoded, ext: 'jpg'} : null;
 	} catch (error) {
-		console.warn('[Immich] Could not re-encode image, keeping the original bytes:', error);
+		console.error('[Immich] Could not re-encode image, keeping the original bytes:', error);
 		return null;
 	} finally {
 		// Large bitmaps are held outside the JS heap; twenty of them will
@@ -829,7 +828,7 @@ async function writeAttachment(app: App, path: string, data: ArrayBuffer): Promi
 	} catch (error) {
 		// Recovery only. The adapter bypasses the vault index, so a file written
 		// this way may not be linkable until the index catches up.
-		console.warn('[Immich] createBinary failed, falling back to the adapter:', error);
+		console.error('[Immich] createBinary failed, falling back to the adapter:', error);
 		await app.vault.adapter.writeBinary(normalizePath(path), data);
 		const file = app.vault.getFileByPath(path);
 		if (file) return file;
@@ -942,7 +941,7 @@ class AssetImporter {
 				ext = extensionForDownload(asset, fetched.contentType, fetched.sizeUsed);
 				this.fellBackToRendition++;
 			} catch (error) {
-				console.warn('[Immich] Could not fetch a displayable rendition:', error);
+				console.error('[Immich] Could not fetch a displayable rendition:', error);
 			}
 		}
 
@@ -1014,7 +1013,7 @@ class AssetImporter {
 				consecutive++;
 				if (consecutive >= CONSECUTIVE_FAILURE_LIMIT) {
 					givenUp = true;
-					console.warn('[Immich] Too many consecutive download failures; linking the rest.');
+					console.error('[Immich] Too many consecutive download failures; linking the rest.');
 				}
 			}
 		}
@@ -1172,7 +1171,6 @@ class ImageSelectorModal extends Modal {
 			try {
 				await refreshCacheFromImmich(this.creds);
 			} catch (error) {
-				console.error('[Immich] Failed to load album:', error);
 				loading.setText('Failed to load the immich album. ' + describeException(error));
 				return;
 			}
@@ -1231,7 +1229,6 @@ class ImageSelectorModal extends Modal {
 				this.onClose();
 				await this.onOpen();
 			} catch (error) {
-				console.error('[Immich] Refresh failed:', error);
 				new Notice('Failed to refresh cache. ' + describeException(error));
 				refresh.disabled = false;
 				refresh.setText('Refresh');
@@ -1252,9 +1249,9 @@ class ImageSelectorModal extends Modal {
 		});
 		this.searchEl = search;
 		search.addEventListener('input', () => {
-			if (this.searchDebounce) window.clearTimeout(this.searchDebounce);
+			if (this.searchDebounce) activeWindow.clearTimeout(this.searchDebounce);
 			// Debounced so that typing does not rebuild the grid on every keystroke.
-			this.searchDebounce = window.setTimeout(() => {
+			this.searchDebounce = activeWindow.setTimeout(() => {
 				this.query = search.value;
 				// Editing the query drops back to instant local filtering; the
 				// smart results no longer correspond to what is in the box.
@@ -1281,12 +1278,13 @@ class ImageSelectorModal extends Modal {
 			// Enter searches; the modifier inserts, so a search cannot be
 			// mistaken for a commit into the note.
 			if (event.metaKey || event.ctrlKey) {
-				this.insertSelection();
+				// Both report their own failures; nothing here can act on a rejection.
+				void this.insertSelection();
 			} else {
-				this.runSmartSearch(search.value.trim());
+				void this.runSmartSearch(search.value.trim());
 			}
 		});
-		window.setTimeout(() => search.focus(), 0);
+		activeWindow.setTimeout(() => search.focus(), 0);
 
 		const filters = toolbar.createDiv({cls: 'obsidian-immich-filters'});
 		const options: Array<{key: TypeFilter, label: string}> = [
@@ -1507,11 +1505,16 @@ class ImageSelectorModal extends Modal {
 	// whenever a download fails.
 	private linkTextFor(asset: ImmichAsset): string {
 		const url = this.assetUrl(asset);
-		const key = this.creds.immichAlbumKey;
+		// Escaped rather than trusted: both halves come from settings the user
+		// pasted into, and the result is written into a note where a stray quote
+		// would add attributes to the <video> tag and a stray bracket would end
+		// the markdown link early.
+		const key = encodeURIComponent(this.creds.immichAlbumKey);
 		if (asset.type === 'VIDEO') {
-			return '<video src="' + url + '/video/playback?key=' + key + '" controls></video>\n';
+			return '<video src="' + escapeAttribute(url + '/video/playback?key=' + key) + '" controls></video>\n';
 		}
-		return '![](' + url + '/thumbnail?size=preview&key=' + key + ')\n';
+		// Angle brackets keep any parenthesis in the URL inside the link.
+		return '![](<' + url + '/thumbnail?size=preview&key=' + key + '>)\n';
 	}
 
 	private isInsertable(asset: ImmichAsset): boolean {
@@ -1632,7 +1635,7 @@ class ImageSelectorModal extends Modal {
 
 	onClose() {
 		if (this.searchDebounce) {
-			window.clearTimeout(this.searchDebounce);
+			activeWindow.clearTimeout(this.searchDebounce);
 			this.searchDebounce = null;
 		}
 		this.observer?.disconnect();
@@ -1663,15 +1666,26 @@ class SettingTab extends PluginSettingTab {
 
 		this.displayMigrationNotice(containerEl);
 
-		new Setting(containerEl)
+		const urlSetting = new Setting(containerEl)
 			.setName('Immich URL')
-			.setDesc('Full URL to your immich instance.')
-			.addText(text => text
-				.setValue(this.plugin.settings.immichUrl)
-				.onChange(async (value) => {
-					this.plugin.settings.immichUrl = normalizeImmichUrl(value);
-					await this.plugin.saveSettings();
-				}));
+			.setDesc('Full URL to your immich instance.');
+		// Said here rather than on the next failed request, which would report it
+		// as a connection problem and send the user looking at the wrong setting.
+		const urlProblemEl = urlSetting.descEl.createDiv({cls: 'obsidian-immich-setting-error'});
+		const showUrlProblem = (value: string) => {
+			// Nothing to complain about while the field is simply still empty.
+			const problem = value ? immichUrlProblem(value) : null;
+			urlProblemEl.setText(problem ?? '');
+			urlProblemEl.toggleClass('is-visible', problem !== null);
+		};
+		urlSetting.addText(text => text
+			.setValue(this.plugin.settings.immichUrl)
+			.onChange(async (value) => {
+				this.plugin.settings.immichUrl = normalizeImmichUrl(value);
+				showUrlProblem(this.plugin.settings.immichUrl);
+				await this.plugin.saveSettings();
+			}));
+		showUrlProblem(this.plugin.settings.immichUrl);
 		new Setting(containerEl)
 			.setName('Immich API key')
 			.setDesc('Stored in Obsidian\'s keychain. Obtained from {IMMICH_URL}/user-settings?isOpen=api-keys.')
@@ -1802,7 +1816,14 @@ class SettingTab extends PluginSettingTab {
 			.addButton((button) => {
 				button.setButtonText("Test connection")
 				button.onClick(async() => {
-					testConnection(this.plugin.credentials())
+					// Disabled while it runs: the test makes up to four requests,
+					// and nothing else indicates that one is already in flight.
+					button.setDisabled(true);
+					try {
+						await testConnection(this.plugin.credentials())
+					} finally {
+						button.setDisabled(false);
+					}
 				})
 			})
 	}
