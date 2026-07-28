@@ -218,6 +218,12 @@ function withoutQuery(url: string): string {
 	return at === -1 ? url : url.slice(0, at);
 }
 
+// Videos are inserted as an HTML tag, so anything interpolated into an
+// attribute has to be unable to close it.
+function escapeAttribute(value: string): string {
+	return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 // Walks the three credentials in the order they are needed, so a failure points
 // at the one setting that is actually wrong: the URL and API key have to work
 // before the album ID is meaningful, and the album has to load before the share
@@ -564,9 +570,9 @@ class ImageSelectorModal extends Modal {
 			attr: {type: 'search', placeholder: 'Search by name, place, or date…', spellcheck: 'false'}
 		});
 		search.addEventListener('input', () => {
-			if (this.searchDebounce) window.clearTimeout(this.searchDebounce);
+			if (this.searchDebounce) activeWindow.clearTimeout(this.searchDebounce);
 			// Debounced so that typing does not rebuild the grid on every keystroke.
-			this.searchDebounce = window.setTimeout(() => {
+			this.searchDebounce = activeWindow.setTimeout(() => {
 				this.query = search.value;
 				this.applyFilter();
 			}, 120);
@@ -578,7 +584,7 @@ class ImageSelectorModal extends Modal {
 				this.insertSelection();
 			}
 		});
-		window.setTimeout(() => search.focus(), 0);
+		activeWindow.setTimeout(() => search.focus(), 0);
 
 		const filters = toolbar.createDiv({cls: 'obsidian-immich-filters'});
 		const options: Array<{key: TypeFilter, label: string}> = [
@@ -697,12 +703,17 @@ class ImageSelectorModal extends Modal {
 
 	private insertionTextFor(asset: ImmichAsset): string | null {
 		const url = this.assetUrl(asset);
-		const key = this.creds.immichAlbumKey;
+		// Escaped rather than trusted: both halves come from settings the user
+		// pasted into, and the result is written into a note where a stray quote
+		// would add attributes to the <video> tag and a stray bracket would end
+		// the markdown link early.
+		const key = encodeURIComponent(this.creds.immichAlbumKey);
 		if (asset.type === 'IMAGE') {
-			return '![](' + url + '/thumbnail?size=preview&key=' + key + ')\n';
+			// Angle brackets keep any parenthesis in the URL inside the link.
+			return '![](<' + url + '/thumbnail?size=preview&key=' + key + '>)\n';
 		}
 		if (asset.type === 'VIDEO') {
-			return '<video src="' + url + '/video/playback?key=' + key + '" controls></video>\n';
+			return '<video src="' + escapeAttribute(url + '/video/playback?key=' + key) + '" controls></video>\n';
 		}
 		return null;
 	}
@@ -753,7 +764,7 @@ class ImageSelectorModal extends Modal {
 
 	onClose() {
 		if (this.searchDebounce) {
-			window.clearTimeout(this.searchDebounce);
+			activeWindow.clearTimeout(this.searchDebounce);
 			this.searchDebounce = null;
 		}
 		this.observer?.disconnect();
@@ -834,7 +845,14 @@ class SettingTab extends PluginSettingTab {
 			.addButton((button) => {
 				button.setButtonText("Test connection")
 				button.onClick(async() => {
-					testConnection(this.plugin.credentials())
+					// Disabled while it runs: the test makes up to four requests,
+					// and nothing else indicates that one is already in flight.
+					button.setDisabled(true);
+					try {
+						await testConnection(this.plugin.credentials())
+					} finally {
+						button.setDisabled(false);
+					}
 				})
 			})
 	}
