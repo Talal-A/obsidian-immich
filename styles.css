@@ -94,3 +94,13 @@
     padding: 16px;
     font-size: 12px;
 }
+
+.obsidian-immich-setting-error {
+    display: none;
+    padding-top: 4px;
+    color: var(--text-error);
+}
+
+.obsidian-immich-setting-error.is-visible {
+    display: block;
+}
