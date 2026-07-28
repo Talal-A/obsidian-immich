@@ -59,7 +59,8 @@
     min-width: 180px;
 }
 
-.obsidian-immich-filters {
+.obsidian-immich-filters,
+.obsidian-immich-mode {
     display: flex;
     gap: 2px;
     padding: 2px;
@@ -67,7 +68,13 @@
     background-color: var(--background-modifier-form-field);
 }
 
-.obsidian-immich-filter {
+/* Pushes the mode toggle to the left of the flex-end footer. */
+.obsidian-immich-mode {
+    margin-right: auto;
+}
+
+.obsidian-immich-filter,
+.obsidian-immich-mode-option {
     box-shadow: none;
     background-color: transparent;
     padding: 4px 12px;
@@ -76,11 +83,13 @@
     cursor: pointer;
 }
 
-.obsidian-immich-filter:hover {
+.obsidian-immich-filter:hover,
+.obsidian-immich-mode-option:hover {
     color: var(--text-normal);
 }
 
-.obsidian-immich-filter.is-active {
+.obsidian-immich-filter.is-active,
+.obsidian-immich-mode-option.is-active {
     background-color: var(--background-primary);
     color: var(--text-normal);
     font-weight: var(--font-medium);
@@ -234,6 +243,23 @@
 .obsidian-immich-clear:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+}
+
+/* Cancel only exists while a download is running. */
+.obsidian-immich-cancel {
+    display: none;
+}
+
+.obsidian-immich-picker.is-importing .obsidian-immich-cancel {
+    display: inline-flex;
+}
+
+/* Nothing in the grid or toolbar should be clickable mid-import. */
+.obsidian-immich-picker.is-importing .obsidian-immich-scroll,
+.obsidian-immich-picker.is-importing .obsidian-immich-toolbar,
+.obsidian-immich-picker.is-importing .obsidian-immich-mode {
+    opacity: 0.5;
+    pointer-events: none;
 }
 
 /* ---- empty states -------------------------------------------------------- */

@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — Immich v3 support, and a rebuilt picker
+
+### Fixed
+
+- **The picker works against Immich v3 again** ([#20](https://github.com/Talal-A/obsidian-immich/issues/20)). v3 removed the `assets` array from `GET /api/albums/{id}`, so the modal threw `Cannot read properties of undefined (reading 'length')` and rendered empty while the refresh notification still reported the right count from `assetCount`. Album assets are now listed via `POST /api/search/metadata`, falling back to the inline array when an older server supplies it. This needs the additional `asset.read` API key permission, which the README documents.
+- The album share key is accepted as either the bare key or the whole share URL. The setup instructions have the user copy a URL and pick the key out of it, so the URL routinely ended up stored — producing a 401 whose message blamed the API key.
+- HTTP failures explain themselves. `requestUrl` throws on any 4xx, so every failure used to surface as `Request failed, status 403`; a 403 now names the missing permission, a 401 names the credential that was rejected, and a 404 names the setting to check.
+- Thumbnails no longer size themselves from `contentEl.innerWidth`, which does not exist on `HTMLElement` and left every image at `width={NaN}`.
+- Assets of a type the plugin cannot insert no longer render a tile that inserts `undefined`, and the reported count matches the tiles on screen.
+- Cache misses, refresh failures, and a missing keychain entry are handled rather than becoming unhandled promise rejections.
+
+### Added
+
+- **Credentials are stored in Obsidian's keychain** (`SecretStorage`, 1.11.4+), which encrypts them through the OS credential store. Only the name of the keychain entry is written to `data.json`. An upgrade that finds plaintext credentials offers a one-press migration and deletes the plaintext copies once the keychain writes succeed. `minAppVersion` moves to 1.11.4.
+- **The picker is rebuilt.** A masonry grid keeps each photo's own aspect ratio instead of cropping to squares — the previous two-column flex assigned tiles by index rather than height, which stranded whitespace beside any tall photo. Clicking now selects rather than inserting immediately, so a misclick no longer writes markdown into the note, and a selection can be revised before it is committed.
+- **Search.** Typing filters the cached album instantly by filename, place, and date. Pressing Enter runs Immich's smart search (`POST /api/search/smart`), which matches on what a photo depicts. Escape clears back to the album before it closes the modal.
+- **Photos can be downloaded into the vault** instead of linked, so a note survives the server going away. Size is chosen from Immich's renditions with optional re-encoding to a maximum edge and JPEG quality. The default is the medium rendition rather than the original, because phone originals are usually HEIC — which Obsidian cannot display and a browser canvas cannot decode, so re-encoding cannot rescue them; an undisplayable original is re-fetched as Immich's rendered version. Videos are never downloaded without asking.
+
+
 ## Unreleased — security pass
 
 Addresses the findings from the [Obsidian community plugin scorecard](https://community.obsidian.md/plugins/immich), which reported 39 issues and a "Caution" review status, plus one exposure the automated scan could not see.
@@ -33,4 +52,6 @@ Addresses the findings from the [Obsidian community plugin scorecard](https://co
 
 ### Known limitation
 
-The share key is still embedded in every inserted link, so it is persisted into the vault and disclosed with any note that is shared or published. Tracked in [issue #2](https://github.com/tuttopassastudios/obsidian-immich/issues/2); see the README for what it means in practice.
+The share key is still embedded in every inserted *link*, so it is persisted into the vault and disclosed with any note that is shared or published. Tracked in [issue #2](https://github.com/tuttopassastudios/obsidian-immich/issues/2); see the README for what it means in practice.
+
+Downloading into the vault avoids this entirely — a downloaded photo is referenced by its vault path, so no credential ends up in the note.
