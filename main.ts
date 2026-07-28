@@ -187,6 +187,12 @@ function withoutQuery(url: string): string {
 	return at === -1 ? url : url.slice(0, at);
 }
 
+// Videos are inserted as an HTML tag, so anything interpolated into an
+// attribute has to be unable to close it.
+function escapeAttribute(value: string): string {
+	return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 // Walks the three credentials in the order they are needed, so a failure points
 // at the one setting that is actually wrong: the URL and API key have to work
 // before the album ID is meaningful, and the album has to load before the share
@@ -525,10 +531,10 @@ class ImageSelectorModal extends Modal {
 
 		this.scrollContainer.addEventListener('scroll', () => {
 			if (this.scrollTimeout) {
-				clearTimeout(this.scrollTimeout);
+				activeWindow.clearTimeout(this.scrollTimeout);
 			}
 
-			this.scrollTimeout = window.setTimeout(() => {
+			this.scrollTimeout = activeWindow.setTimeout(() => {
 				this.checkAndLoadMore(left, right, totalAssets, loadingDiv);
 			}, 150); // Throttle to 150ms
 		});
@@ -564,16 +570,10 @@ class ImageSelectorModal extends Modal {
 			if (this.loadedAssets.has(i)) continue;
 
 			const asset = assets[i];
-			const assetUrl = this.creds.immichUrl + '/api/assets/' + asset['id'];
-			const keyParam = '&key=' + this.creds.immichAlbumKey;
-			const thumbUrl = assetUrl + '/thumbnail?size=thumbnail' + keyParam;
+			const thumbUrl = this.assetUrl(asset) + '/thumbnail?size=thumbnail&key=' + this.creds.immichAlbumKey;
 
-			let insertionText: string;
-			if (asset['type'] === "IMAGE") {
-				insertionText = '![](' + assetUrl + '/thumbnail?size=preview' + keyParam + ')\n';
-			} else if (asset['type'] === "VIDEO") {
-				insertionText = '<video src="' + assetUrl + '/video/playback?key=' + this.creds.immichAlbumKey + '" controls></video>\n';
-			} else {
+			const insertionText = this.insertionTextFor(asset);
+			if (insertionText === null) {
 				// Unknown asset type - nothing sensible to insert, so skip it
 				// rather than rendering a tile that inserts `undefined`.
 				continue;
@@ -599,7 +599,7 @@ class ImageSelectorModal extends Modal {
 
 		this.currentPage = endIndex;
 
-		setTimeout(() => {
+		activeWindow.setTimeout(() => {
 			this.isLoading = false;
 			if (endIndex >= totalAssets) {
 				loadingDiv.style.display = 'none';
@@ -607,9 +607,30 @@ class ImageSelectorModal extends Modal {
 		}, 100);
 	}
 
+	private assetUrl(asset: ImmichAsset): string {
+		return this.creds.immichUrl + '/api/assets/' + asset.id;
+	}
+
+	private insertionTextFor(asset: ImmichAsset): string | null {
+		const url = this.assetUrl(asset);
+		// Escaped rather than trusted: both halves come from settings the user
+		// pasted into, and the result is written into a note where a stray quote
+		// would add attributes to the <video> tag and a stray bracket would end
+		// the markdown link early.
+		const key = encodeURIComponent(this.creds.immichAlbumKey);
+		if (asset.type === 'IMAGE') {
+			// Angle brackets keep any parenthesis in the URL inside the link.
+			return '![](<' + url + '/thumbnail?size=preview&key=' + key + '>)\n';
+		}
+		if (asset.type === 'VIDEO') {
+			return '<video src="' + escapeAttribute(url + '/video/playback?key=' + key) + '" controls></video>\n';
+		}
+		return null;
+	}
+
 	onClose() {
 		if (this.scrollTimeout) {
-			clearTimeout(this.scrollTimeout);
+			activeWindow.clearTimeout(this.scrollTimeout);
 			this.scrollTimeout = null;
 		}
 		this.loadedAssets.clear();
@@ -688,7 +709,14 @@ class SettingTab extends PluginSettingTab {
 			.addButton((button) => {
 				button.setButtonText("Test connection")
 				button.onClick(async() => {
-					testConnection(this.plugin.credentials())
+					// Disabled while it runs: the test makes up to four requests,
+					// and nothing else indicates that one is already in flight.
+					button.setDisabled(true);
+					try {
+						await testConnection(this.plugin.credentials())
+					} finally {
+						button.setDisabled(false);
+					}
 				})
 			})
 	}
