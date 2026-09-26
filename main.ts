@@ -1,4 +1,4 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, RequestUrlResponse, Setting, requestUrl } from 'obsidian';
+import { App, Editor, Modal, Notice, Plugin, PluginSettingTab, RequestUrlParam, RequestUrlResponse, Setting, requestUrl } from 'obsidian';
 
 interface PluginSettings {
 	immichUrl: string;
@@ -14,10 +14,94 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	immichAlbumKey: ''
 }
 
-let cachedResult: RequestUrlResponse;
+interface ImmichAsset {
+	id: string;
+	type: string;
+}
+
+interface AlbumCache {
+	albumName: string;
+	assets: ImmichAsset[];
+	fingerprint: string;
+}
+
+let cachedResult: AlbumCache | null = null;
 
 function normalizeImmichUrl(value: string): string {
 	return value.trim().replace(/\/+$/, '');
+}
+
+// The setup instructions have the user copy a share URL and pick the key out of
+// it, so the whole URL routinely ends up stored instead. Immich then receives a
+// URL where it expects a token and answers 401, which is an unhelpful way to
+// find out. Accept either form.
+function normalizeAlbumShareKey(value: string): string {
+	let key = value.trim();
+	const marker = key.lastIndexOf('/share/');
+	if (marker !== -1) {
+		key = key.slice(marker + '/share/'.length);
+	}
+	// Drop anything after the key itself, plus any trailing separators.
+	key = key.split(/[?#]/)[0];
+	return key.replace(/\/+$/, '');
+}
+
+// Identifies the settings the cache was built from, so that changing the
+// instance/album/credentials invalidates it instead of showing stale assets.
+function settingsFingerprint(settings: PluginSettings): string {
+	return JSON.stringify([settings.immichUrl, settings.immichAlbum, settings.immichApiKey, settings.immichAlbumKey]);
+}
+
+function apiHeaders(settings: PluginSettings): Record<string, string> {
+	return {
+		'Accept': 'application/json',
+		'x-api-key': settings.immichApiKey.toString()
+	};
+}
+
+// The permissions the plugin's API key needs. `asset.read` is the one that
+// existing keys tend to lack, since it only became necessary when Immich v3
+// moved album listing to the search API.
+const REQUIRED_PERMISSIONS = 'server.about, album.read, and asset.read';
+
+// Which credential a given request is authenticated by, so that a rejection can
+// point at the setting that actually needs fixing. Asset media is fetched with
+// the album share key; everything else uses the API key.
+type AuthKind = 'api-key' | 'share-key';
+
+function describeHttpFailure(status: number, context: string, auth: AuthKind): string {
+	switch (status) {
+		case 401:
+			return auth === 'share-key'
+				? 'Immich rejected the album share key (401) while ' + context + '. Check it in the plugin ' +
+					'settings - it should be only the key from the end of the share URL, not the whole URL.'
+				: 'Immich rejected the API key (401) while ' + context + '. Check the API key in the plugin settings.';
+		case 403:
+			return auth === 'share-key'
+				? 'Immich denied access (403) while ' + context + '. The album share link may have expired, or ' +
+					'the album share key may be wrong.'
+				: 'Immich denied access (403) while ' + context + '. The API key is most likely missing a ' +
+					'required permission - this plugin needs ' + REQUIRED_PERMISSIONS + '.';
+		case 404:
+			return 'Immich returned not found (404) while ' + context + '. Check the Immich URL and album ID.';
+		default:
+			return 'Immich returned status ' + status + ' while ' + context + '.';
+	}
+}
+
+// requestUrl throws its own opaque "Request failed, status NNN" for any 4xx/5xx,
+// which hides which permission or setting is actually at fault. Handle the
+// status directly so the failure can be explained in terms the user can act on.
+async function immichRequest(params: RequestUrlParam, context: string, auth: AuthKind = 'api-key'): Promise<RequestUrlResponse> {
+	const result = await requestUrl({ ...params, throw: false });
+	if (result.status < 200 || result.status >= 300) {
+		throw new Error(describeHttpFailure(result.status, context, auth));
+	}
+	return result;
+}
+
+function describeException(exception: unknown): string {
+	return exception instanceof Error ? exception.message : String(exception);
 }
 
 async function testConnection(settings: PluginSettings) {
@@ -28,15 +112,12 @@ async function testConnection(settings: PluginSettings) {
 	new Notice("Testing connection to " + url);
 	try {
 		const startTime = Date.now();
-		const result = await requestUrl({
+		const result = await immichRequest({
 			url: url.toString(),
-			headers: {
-				'Accept': 'application/json',
-				'x-api-key': settings.immichApiKey.toString()
-			}
-		})
+			headers: apiHeaders(settings)
+		}, 'contacting the server')
 		const duration = Date.now() - startTime;
-		
+
 		console.log('[Immich] Connection response:', {
 			status: result.status,
 			statusText: result.status === 200 ? 'OK' : 'Error',
@@ -60,20 +141,17 @@ async function testConnection(settings: PluginSettings) {
 				hasApiKey: !!settings.immichApiKey
 			}
 		});
-		new Notice("Failed to connect to " + settings.immichUrl + " - check the console for additional information.")
+		new Notice("Failed to connect to " + settings.immichUrl + ". " + describeException(exception))
 	}	
 	const url2 = new URL(settings.immichUrl + '/api/albums/' + settings.immichAlbum);
 	console.log('[Immich] Testing album access with URL:', url2.toString());
 	let albumResult: RequestUrlResponse | null = null;
 	try {
 		const startTime = Date.now();
-		const result = await requestUrl({
+		const result = await immichRequest({
 			url: url2.toString(),
-			headers: {
-				'Accept': 'application/json',
-				'x-api-key': settings.immichApiKey.toString()
-			}
-		})
+			headers: apiHeaders(settings)
+		}, 'loading the album')
 		const duration = Date.now() - startTime;
 		
 		console.log('[Immich] Album access response:', {
@@ -101,22 +179,33 @@ async function testConnection(settings: PluginSettings) {
 				albumId: settings.immichAlbum
 			}
 		});
-		new Notice("Failed to access album - check the console for additional information.")
+		new Notice("Failed to access album. " + describeException(exception))
 	}
-	// If there is an item in the album, also test access to the first asset to verify that the album key is correct
-	if (albumResult && albumResult.json['assets'] && albumResult.json['assets'].length > 0) {
-		const assetId = albumResult.json['assets'][0]['id'];
+	// If there is an item in the album, also test access to the first asset to verify that the album key is correct.
+	// Immich v3 no longer inlines the assets in the album response, so look them up separately when needed.
+	let firstAsset: ImmichAsset | null = null;
+	if (albumResult) {
+		try {
+			const assets = await fetchAlbumAssets(settings, albumResult.json ?? {});
+			firstAsset = assets[0] ?? null;
+			if (assets.length === 0) {
+				console.log('[Immich] Album contains no assets - skipping asset access test.');
+			}
+		} catch (exception) {
+			console.error('[Immich] Failed to list album assets:', exception);
+			new Notice("Failed to list album assets. " + describeException(exception));
+		}
+	}
+	if (firstAsset) {
+		const assetId = firstAsset['id'];
 		const url3 = new URL(settings.immichUrl + '/api/assets/' + assetId + '/thumbnail?size=thumbnail&key=' + settings.immichAlbumKey);
 		console.log('[Immich] Testing asset access with URL:', url3.toString());
 		try {
 			const startTime = Date.now();
-			const result = await requestUrl({
+			const result = await immichRequest({
 				url: url3.toString(),
-				headers: {
-					'Accept': 'application/json',
-					'x-api-key': settings.immichApiKey.toString()
-				}
-			})
+				headers: apiHeaders(settings)
+			}, 'reading an asset thumbnail', 'share-key')
 			const duration = Date.now() - startTime;
 			
 			console.log('[Immich] Asset access response:', {
@@ -144,23 +233,75 @@ async function testConnection(settings: PluginSettings) {
 					albumKey: settings.immichAlbumKey
 				}
 			});
-			new Notice("Failed to access asset - check the console for additional information. This may indicate an issue with the album key.");
+			new Notice("Failed to access asset. " + describeException(exception) + " This may also indicate an issue with the album share key.");
 		}
 	}
 }
 
+// Immich v3 removed the `assets` array from the album response, so the assets
+// have to be fetched separately via the search API. Older servers still inline
+// them, so use those when present to avoid an extra round trip.
+async function fetchAlbumAssets(settings: PluginSettings, album: Record<string, unknown>): Promise<ImmichAsset[]> {
+	const inlined = album['assets'];
+	if (Array.isArray(inlined)) {
+		return inlined as ImmichAsset[];
+	}
+
+	const url = new URL(settings.immichUrl + '/api/search/metadata');
+	const order = album['order'] === 'asc' ? 'asc' : 'desc';
+	const pageSize = 1000; // Maximum permitted by the search API.
+	const assets: ImmichAsset[] = [];
+	let page = 1;
+
+	// The search API is paginated and reports the next page to request, if any.
+	while (page > 0) {
+		const result = await immichRequest({
+			url: url.toString(),
+			method: 'POST',
+			headers: { ...apiHeaders(settings), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				albumIds: [settings.immichAlbum],
+				order: order,
+				page: page,
+				size: pageSize
+			})
+		}, 'listing the album\'s assets');
+
+		const searchAssets = result.json?.['assets'];
+		const items: ImmichAsset[] = searchAssets?.['items'] ?? [];
+		assets.push(...items);
+
+		const nextPage = Number(searchAssets?.['nextPage']);
+		page = Number.isFinite(nextPage) && nextPage > page ? nextPage : 0;
+
+		// Defensive stop: a server that keeps handing back a next page would
+		// otherwise loop forever.
+		if (items.length === 0) {
+			break;
+		}
+	}
+
+	return assets;
+}
+
 async function refreshCacheFromImmich(settings: PluginSettings, silent=true) {
 	const url = new URL(settings.immichUrl + '/api/albums/' + settings.immichAlbum);
-	const result = await requestUrl({
+	const result = await immichRequest({
 		url: url.toString(),
-		headers: {
-			'Accept': 'application/json',
-			'x-api-key': settings.immichApiKey.toString()
-		}
-	})	
-	cachedResult = result;
+		headers: apiHeaders(settings)
+	}, 'loading the album');
+
+	const album = result.json ?? {};
+	const assets = await fetchAlbumAssets(settings, album);
+
+	cachedResult = {
+		albumName: album['albumName'] ?? '',
+		assets: assets,
+		fingerprint: settingsFingerprint(settings)
+	};
+
 	if(!silent) {
-		new Notice('Immich album cache completed for album \'' + cachedResult.json['albumName'] + '\'. Found ' + cachedResult.json['assetCount'] + ' assets.');
+		new Notice('Immich album cache completed for album \'' + cachedResult.albumName + '\'. Found ' + assets.length + ' assets.');
 	}
 }
 
@@ -183,7 +324,10 @@ export default class ObsidianImmich extends Plugin {
 			name: 'Refresh album cache',
 			callback: () => {
 				new Notice('Refreshing immich cache.');
-				refreshCacheFromImmich(this.settings, false);
+				refreshCacheFromImmich(this.settings, false).catch((error) => {
+					console.error('[Immich] Failed to refresh album cache:', error);
+					new Notice('Failed to refresh the immich album cache. ' + describeException(error));
+				});
 			}
 		});
 
@@ -197,6 +341,8 @@ export default class ObsidianImmich extends Plugin {
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 		this.settings.immichUrl = normalizeImmichUrl(this.settings.immichUrl);
+		this.settings.immichApiKey = this.settings.immichApiKey.trim();
+		this.settings.immichAlbumKey = normalizeAlbumShareKey(this.settings.immichAlbumKey);
 	}
 
 	async saveSettings() {
@@ -229,16 +375,35 @@ class ImageSelectorModal extends Modal {
 	async onOpen() {
 		const {contentEl} = this;
 
-		if (cachedResult == null) {
-			await refreshCacheFromImmich(this.settings);
+		// Reset paging state so that reopening after a refresh starts from the
+		// top of the album rather than resuming an old scroll position.
+		this.currentPage = 0;
+		this.isLoading = false;
+		this.loadedAssets.clear();
+
+		if (cachedResult == null || cachedResult.fingerprint !== settingsFingerprint(this.settings)) {
+			try {
+				await refreshCacheFromImmich(this.settings);
+			} catch (error) {
+				console.error('[Immich] Failed to load album:', error);
+				contentEl.createDiv({cls: 'obsidian-immich-empty'}).setText(
+					'Failed to load the immich album. ' + describeException(error)
+				);
+				return;
+			}
+		}
+
+		const cache = cachedResult;
+		if (cache == null) {
+			return;
 		}
 
 		// Create header with title and refresh button
 		const header = contentEl.createDiv({cls: 'obsidian-immich-header'});
-		
+
 		const titleDiv = header.createDiv({cls: 'obsidian-immich-title'});
-		titleDiv.setText('Insert from album: ' + (cachedResult.json['albumName'] || 'Select Image'));
-		
+		titleDiv.setText('Insert from album: ' + (cache.albumName || 'Select Image'));
+
 		const refreshButton = header.createEl('button', {
 			text: '\u21bb',
 			cls: 'obsidian-immich-refresh-button'
@@ -250,23 +415,27 @@ class ImageSelectorModal extends Modal {
 				await refreshCacheFromImmich(this.settings, false);
 				// Reload the modal
 				this.onClose();
-				this.onOpen();
+				await this.onOpen();
 			} catch (error) {
-				new Notice('Failed to refresh cache');
+				new Notice('Failed to refresh cache. ' + describeException(error));
 				console.error('Refresh failed:', error);
 				refreshButton.disabled = false;
 				refreshButton.setText('\u21bb Refresh');
 			}
 		};
 
-		const totalWidth = contentEl.innerWidth;
-		const totalAssets = cachedResult.json['assets'].length;
+		const totalAssets = cache.assets.length;
+
+		if (totalAssets === 0) {
+			contentEl.createDiv({cls: 'obsidian-immich-empty'}).setText(
+				'This album has no assets. Add images to it in immich, then refresh.'
+			);
+			return;
+		}
 
 		// Create scroll container
 		this.scrollContainer = contentEl.createDiv({cls: 'obsidian-immich-scroll-container'});
 		this.scrollContainer.setAttribute('data-immich-modal-content', 'true');
-		this.scrollContainer.style.maxHeight = '70vh';
-		this.scrollContainer.style.overflowY = 'auto';
 
 		const row = this.scrollContainer.createDiv({cls: 'obsidian-immich-row'});
 		const leftImageDiv = row.createDiv({cls: 'obsidian-immich-column'});
@@ -280,14 +449,14 @@ class ImageSelectorModal extends Modal {
 		loadingDiv.style.display = 'none';
 
 		// Setup scroll listener with throttling
-		this.setupScrollListener(left, right, totalWidth, totalAssets, loadingDiv);
-		
+		this.setupScrollListener(left, right, totalAssets, loadingDiv);
+
 		// Initial load: load more items to ensure scrollbar appears on large screens
 		const initialBatchSize = Math.max(this.batchSize * 3, 20); // Load at least 20 items initially
-		this.loadBatch(left, right, totalWidth, 0, Math.min(initialBatchSize, totalAssets), loadingDiv, totalAssets);
+		this.loadBatch(left, right, 0, Math.min(initialBatchSize, totalAssets), loadingDiv, totalAssets);
 	}
 
-	private setupScrollListener(left: HTMLElement, right: HTMLElement, totalWidth: number, totalAssets: number, loadingDiv: HTMLElement) {
+	private setupScrollListener(left: HTMLElement, right: HTMLElement, totalAssets: number, loadingDiv: HTMLElement) {
 		if (!this.scrollContainer) return;
 
 		this.scrollContainer.addEventListener('scroll', () => {
@@ -296,12 +465,12 @@ class ImageSelectorModal extends Modal {
 			}
 
 			this.scrollTimeout = window.setTimeout(() => {
-				this.checkAndLoadMore(left, right, totalWidth, totalAssets, loadingDiv);
+				this.checkAndLoadMore(left, right, totalAssets, loadingDiv);
 			}, 150); // Throttle to 150ms
 		});
 	}
 
-	private checkAndLoadMore(left: HTMLElement, right: HTMLElement, totalWidth: number, totalAssets: number, loadingDiv: HTMLElement) {
+	private checkAndLoadMore(left: HTMLElement, right: HTMLElement, totalAssets: number, loadingDiv: HTMLElement) {
 		if (!this.scrollContainer || this.isLoading || this.currentPage >= totalAssets) {
 			return;
 		}
@@ -314,40 +483,44 @@ class ImageSelectorModal extends Modal {
 		// Load more when user scrolls past 60% or when near bottom
 		if (scrollPercentage > 0.6 || (scrollHeight - (scrollTop + clientHeight) < 300)) {
 			const endIndex = Math.min(this.currentPage + this.batchSize, totalAssets);
-			this.loadBatch(left, right, totalWidth, this.currentPage, endIndex, loadingDiv, totalAssets);
+			this.loadBatch(left, right, this.currentPage, endIndex, loadingDiv, totalAssets);
 		}
 	}
 
-	private loadBatch(left: HTMLElement, right: HTMLElement, totalWidth: number, startIndex: number, endIndex: number, loadingDiv: HTMLElement, totalAssets: number) {
+	private loadBatch(left: HTMLElement, right: HTMLElement, startIndex: number, endIndex: number, loadingDiv: HTMLElement, totalAssets: number) {
 		if (this.isLoading || startIndex >= totalAssets) return;
-		
+
+		const assets = cachedResult?.assets;
+		if (!assets) return;
+
 		this.isLoading = true;
 		loadingDiv.style.display = 'block';
-
-		const assets = cachedResult.json['assets'];
 
 		for (let i = startIndex; i < endIndex; i++) {
 			if (this.loadedAssets.has(i)) continue;
 
 			const asset = assets[i];
-			const thumbUrl = this.settings.immichUrl + '/api/assets/' + asset['id'] + '/thumbnail?size=thumbnail&key=' + this.settings.immichAlbumKey;
-			
+			const assetUrl = this.settings.immichUrl + '/api/assets/' + asset['id'];
+			const keyParam = '&key=' + this.settings.immichAlbumKey;
+			const thumbUrl = assetUrl + '/thumbnail?size=thumbnail' + keyParam;
+
 			let insertionText: string;
 			if (asset['type'] === "IMAGE") {
-				const previewUrl = this.settings.immichUrl + '/api/assets/' + asset['id'] + '/thumbnail?size=preview&key=' + this.settings.immichAlbumKey;
-				insertionText = '![](' + previewUrl + ')\n';
+				insertionText = '![](' + assetUrl + '/thumbnail?size=preview' + keyParam + ')\n';
 			} else if (asset['type'] === "VIDEO") {
-				insertionText = '<video src="' + this.settings.immichUrl + '/api/assets/' + asset['id'] + '/video/playback?key=' + this.settings.immichAlbumKey + '" controls></video>\n';
+				insertionText = '<video src="' + assetUrl + '/video/playback?key=' + this.settings.immichAlbumKey + '" controls></video>\n';
+			} else {
+				// Unknown asset type - nothing sensible to insert, so skip it
+				// rather than rendering a tile that inserts `undefined`.
+				continue;
 			}
 
 			const targetColumn = (i & 1) ? right : left;
 			const overallDiv = targetColumn.createDiv({cls: 'obsidian-immich-overallDiv'});
-			
+
 			const imgElement = overallDiv.createEl("img");
 			imgElement.src = thumbUrl;
-			imgElement.width = (totalWidth / 2) - 5;
-			imgElement.style.cursor = 'pointer';
-			
+
 			imgElement.onclick = () => {
 				this.editor.replaceSelection(insertionText);
 				overallDiv.setCssStyles({opacity: '0.5'});
@@ -373,8 +546,12 @@ class ImageSelectorModal extends Modal {
 	onClose() {
 		if (this.scrollTimeout) {
 			clearTimeout(this.scrollTimeout);
+			this.scrollTimeout = null;
 		}
 		this.loadedAssets.clear();
+		this.scrollContainer = null;
+		this.currentPage = 0;
+		this.isLoading = false;
 		const {contentEl} = this;
 		contentEl.empty();
 	}
@@ -407,7 +584,7 @@ class SettingTab extends PluginSettingTab {
 			.addText(text => text
 				.setValue(this.plugin.settings.immichApiKey)
 				.onChange(async (value) => {
-					this.plugin.settings.immichApiKey = value;
+					this.plugin.settings.immichApiKey = value.trim();
 					await this.plugin.saveSettings();
 				}));
 		new Setting(containerEl)
@@ -421,11 +598,11 @@ class SettingTab extends PluginSettingTab {
 				}));
 		new Setting(containerEl)
 			.setName('Immich album share key')
-			.setDesc('Share key which shows up in the URL of your album.')
+			.setDesc('Share key which shows up in the URL of your album. Pasting the whole share URL also works.')
 			.addText(text => text
 				.setValue(this.plugin.settings.immichAlbumKey)
 				.onChange(async (value) => {
-					this.plugin.settings.immichAlbumKey = value;
+					this.plugin.settings.immichAlbumKey = normalizeAlbumShareKey(value);
 					await this.plugin.saveSettings();
 				}));
 		new Setting(containerEl)
