@@ -30,7 +30,7 @@ The practical mitigations today:
 - Keep your Immich instance off the public internet if you can. The key is only useful to someone who can reach the server.
 - Rotate the share key in Immich if a note containing it has been published. Existing notes will stop rendering and need re-inserting.
 
-This is a known design limitation, not a bug — see [issue #2](https://github.com/tuttopassastudios/obsidian-immich/issues/2), which tracks the options for removing the credential from note content.
+This is a known design limitation, not a bug — see [issue #2](https://github.com/Talal-A/obsidian-immich/issues/2), which tracks the options for removing the credential from note content.
 
 ## Features
 

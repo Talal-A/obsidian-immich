@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Report privately through [GitHub's security advisory form](https://github.com/tuttopassastudios/obsidian-immich/security/advisories/new) rather than opening a public issue.
+Report privately through [GitHub's security advisory form](https://github.com/Talal-A/obsidian-immich/security/advisories/new) rather than opening a public issue.
 
 Useful things to include: what an attacker gets, the steps to reproduce, and the plugin and Obsidian versions. If a proof of concept involves your own Immich instance, please redact your URL, API key and share key — see below for why those are easy to leak by accident.
 
@@ -25,7 +25,7 @@ The API key is sent as an `x-api-key` header on requests to the album and search
 
 Inserted images and videos carry the share key in their URL, so it is persisted into the vault as note content. The key grants read access to the whole shared album.
 
-This is documented for users in the [README](README.md#the-share-key-is-written-into-your-notes) and tracked in [issue #2](https://github.com/tuttopassastudios/obsidian-immich/issues/2). It is a design limitation rather than an oversight — but it is the plugin's most significant exposure, and any change to how assets are referenced should be weighed against it.
+This is documented for users in the [README](README.md#the-share-key-is-written-into-your-notes) and tracked in [issue #2](https://github.com/Talal-A/obsidian-immich/issues/2). It is a design limitation rather than an oversight — but it is the plugin's most significant exposure, and any change to how assets are referenced should be weighed against it.
 
 ## Rules for contributors
 
