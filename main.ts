@@ -823,20 +823,7 @@ async function resolveAttachmentTarget(
 }
 
 async function writeAttachment(app: App, path: string, data: ArrayBuffer): Promise<TFile> {
-	try {
-		return await app.vault.createBinary(path, data);
-	} catch (error) {
-		// Recovery only. The adapter bypasses the vault index, so a file written
-		// this way may not be linkable until the index catches up.
-		console.error('[Immich] createBinary failed, falling back to the adapter:', error);
-		await app.vault.adapter.writeBinary(normalizePath(path), data);
-		const file = app.vault.getFileByPath(path);
-		if (file) return file;
-		await new Promise(resolve => window.setTimeout(resolve, 50));
-		const retried = app.vault.getFileByPath(path);
-		if (retried) return retried;
-		throw error;
-	}
+	return app.vault.createBinary(path, data);
 }
 
 function embedMarkdown(app: App, file: TFile, sourcePath: string, embed: boolean): string {
@@ -873,6 +860,11 @@ interface ImportResult {
 	notes: string[];
 }
 
+interface ImportedAsset {
+	markdown: string;
+	downloaded: boolean;
+}
+
 // Stop trying after this many failures in a row: a wrong share key or a missing
 // permission fails every asset, and there is no sense working through twenty of
 // them to discover that.
@@ -885,6 +877,7 @@ class AssetImporter {
 	private options: ImportOptions;
 	private done = new Map<string, {file: TFile, embed: boolean}>();
 	private cancelled = false;
+	private createdFiles: TFile[] = [];
 
 	private firstError = '';
 	private downgraded = 0;
@@ -912,10 +905,10 @@ class AssetImporter {
 		return downloadFileName(asset, ext);
 	}
 
-	private async importOne(asset: ImmichAsset): Promise<string> {
+	private async importOne(asset: ImmichAsset): Promise<ImportedAsset> {
 		const cached = this.done.get(asset.id);
 		if (cached) {
-			return embedMarkdown(this.app, cached.file, this.sourcePath, cached.embed);
+			return {markdown: embedMarkdown(this.app, cached.file, this.sourcePath, cached.embed), downloaded: false};
 		}
 
 		if (this.options.reuseExisting) {
@@ -923,7 +916,7 @@ class AssetImporter {
 			if (probe.existing) {
 				const embed = isRenderable(asset, splitFileName(probe.existing.name).ext);
 				this.done.set(asset.id, {file: probe.existing, embed});
-				return embedMarkdown(this.app, probe.existing, this.sourcePath, embed);
+				return {markdown: embedMarkdown(this.app, probe.existing, this.sourcePath, embed), downloaded: false};
 			}
 		}
 
@@ -962,9 +955,30 @@ class AssetImporter {
 		const target = await resolveAttachmentTarget(
 			this.app, downloadFileName(asset, ext), this.sourcePath, this.options.reuseExisting
 		);
+		const downloaded = target.existing === null;
 		const file = target.existing ?? await writeAttachment(this.app, target.path, data);
+		if (downloaded) this.createdFiles.push(file);
 		this.done.set(asset.id, {file, embed});
-		return embedMarkdown(this.app, file, this.sourcePath, embed);
+		return {markdown: embedMarkdown(this.app, file, this.sourcePath, embed), downloaded};
+	}
+
+	private async cancelledResult(failed: number, downloaded: number, reused: number): Promise<ImportResult> {
+		const failedRemovals: string[] = [];
+		for (const file of this.createdFiles) {
+			try {
+				await this.app.vault.delete(file, true);
+			} catch (error) {
+				console.error('[Immich] Failed to remove cancelled download ' + file.path + ':', error);
+				failedRemovals.push(file.path);
+			}
+		}
+		this.createdFiles = [];
+		const notes = failedRemovals.length === 0
+			? []
+			: ['Could not remove ' + failedRemovals.length +
+				(failedRemovals.length === 1 ? ' cancelled download: ' : ' cancelled downloads: ') +
+				failedRemovals.join(', ') + '.'];
+		return {markdown: '', failed, downloaded, reused, cancelled: true, notes};
 	}
 
 	async importAll(
@@ -981,7 +995,7 @@ class AssetImporter {
 
 		for (let i = 0; i < assets.length; i++) {
 			if (this.cancelled) {
-				return {markdown: '', failed, downloaded, reused, cancelled: true, notes: []};
+				return this.cancelledResult(failed, downloaded, reused);
 			}
 
 			const asset = assets[i];
@@ -999,9 +1013,12 @@ class AssetImporter {
 			}
 
 			try {
-				const before = this.done.size;
-				parts.push(await this.importOne(asset));
-				if (this.done.size > before) downloaded++; else reused++;
+				const imported = await this.importOne(asset);
+				if (this.cancelled) {
+					return this.cancelledResult(failed, downloaded, reused);
+				}
+				parts.push(imported.markdown);
+				if (imported.downloaded) downloaded++; else reused++;
 				consecutive = 0;
 			} catch (error) {
 				console.error('[Immich] Failed to download ' + asset.fileName + ':', error);
@@ -1038,6 +1055,9 @@ class AssetImporter {
 				' inserted as a link rather than an embed.');
 		}
 
+		if (this.cancelled) {
+			return this.cancelledResult(failed, downloaded, reused);
+		}
 		return {markdown: parts.join(''), failed, downloaded, reused, cancelled: false, notes};
 	}
 }
@@ -1134,6 +1154,7 @@ class ImageSelectorModal extends Modal {
 	private smartResults: ImmichAsset[] | null = null;
 	private smartQuery = '';
 	private searching = false;
+	private smartSearchRequest = 0;
 
 	private gridEl: HTMLElement | null = null;
 	private sentinelEl: HTMLElement | null = null;
@@ -1207,6 +1228,7 @@ class ImageSelectorModal extends Modal {
 		this.smartResults = null;
 		this.smartQuery = '';
 		this.searching = false;
+		this.smartSearchRequest++;
 		this.insertMode = this.settings.insertMode;
 		this.importing = false;
 		this.importer = null;
@@ -1250,6 +1272,8 @@ class ImageSelectorModal extends Modal {
 		this.searchEl = search;
 		search.addEventListener('input', () => {
 			if (this.searchDebounce) activeWindow.clearTimeout(this.searchDebounce);
+			this.smartSearchRequest++;
+			this.searching = false;
 			// Debounced so that typing does not rebuild the grid on every keystroke.
 			this.searchDebounce = activeWindow.setTimeout(() => {
 				this.query = search.value;
@@ -1266,6 +1290,8 @@ class ImageSelectorModal extends Modal {
 			if (event.key === 'Escape' && (this.smartResults !== null || search.value !== '')) {
 				event.preventDefault();
 				event.stopPropagation();
+				this.smartSearchRequest++;
+				this.searching = false;
 				search.value = '';
 				this.query = '';
 				this.smartResults = null;
@@ -1297,9 +1323,17 @@ class ImageSelectorModal extends Modal {
 			button.setText(option.label);
 			button.toggleClass('is-active', this.typeFilter === option.key);
 			button.onclick = () => {
+				const abandonSmartSearch = this.smartResults !== null || this.searching;
 				this.typeFilter = option.key;
 				filters.findAll('.obsidian-immich-filter').forEach(el => el.removeClass('is-active'));
 				button.addClass('is-active');
+				if (abandonSmartSearch) {
+					this.smartSearchRequest++;
+					this.searching = false;
+					this.smartResults = null;
+					this.smartQuery = '';
+					this.query = this.searchEl?.value ?? this.query;
+				}
 				this.applyFilter();
 			};
 		}
@@ -1382,10 +1416,11 @@ class ImageSelectorModal extends Modal {
 	// Immich's smart search matches on what a photo shows, which no amount of
 	// local filename matching can approximate - so it runs against the server.
 	private async runSmartSearch(query: string) {
-		if (this.searching) return;
+		const request = ++this.smartSearchRequest;
 		if (!query) {
 			this.smartResults = null;
 			this.smartQuery = '';
+			this.searching = false;
 			this.applyFilter();
 			return;
 		}
@@ -1394,16 +1429,20 @@ class ImageSelectorModal extends Modal {
 		this.updateStatus();
 		try {
 			const results = await smartSearch(this.creds, query, this.typeFilter);
+			if (request !== this.smartSearchRequest) return;
 			this.smartResults = results;
 			this.smartQuery = query;
 		} catch (error) {
+			if (request !== this.smartSearchRequest) return;
 			console.error('[Immich] Smart search failed:', error);
 			new Notice('Smart search failed. ' + describeException(error));
 			this.smartResults = null;
 			this.smartQuery = '';
 		} finally {
-			this.searching = false;
-			this.applyFilter();
+			if (request === this.smartSearchRequest) {
+				this.searching = false;
+				this.applyFilter();
+			}
 		}
 	}
 
@@ -1594,7 +1633,7 @@ class ImageSelectorModal extends Modal {
 		const from = this.editor.getCursor('from');
 		const to = this.editor.getCursor('to');
 
-		this.importer = new AssetImporter(this.app, this.creds, this.sourcePath, {
+		const importer = new AssetImporter(this.app, this.creds, this.sourcePath, {
 			size: this.settings.downloadSize,
 			reencode: this.settings.reencode,
 			maxEdge: this.settings.maxEdge,
@@ -1603,17 +1642,18 @@ class ImageSelectorModal extends Modal {
 			renditionFallback: this.settings.renditionFallback,
 			downloadVideos: downloadVideos
 		});
+		this.importer = importer;
 		this.setImporting(true);
 
 		try {
-			const result = await this.importer.importAll(
+			const result = await importer.importAll(
 				chosen,
 				progress => this.showProgress(progress),
 				asset => this.linkTextFor(asset)
 			);
 
 			if (result.cancelled) {
-				new Notice('Download cancelled. Nothing was inserted.');
+				new Notice(['Download cancelled. Nothing was inserted.'].concat(result.notes).join(' '), result.notes.length > 0 ? 12000 : 4000);
 				return;
 			}
 
@@ -1626,18 +1666,23 @@ class ImageSelectorModal extends Modal {
 			console.error('[Immich] Import failed:', error);
 			new Notice('Failed to insert. ' + describeException(error));
 		} finally {
-			this.setImporting(false);
-			this.importer = null;
-			if (this.insertButtonEl) this.insertButtonEl.setText('Insert');
-			this.updateStatus();
+			if (this.importer === importer) {
+				this.setImporting(false);
+				this.importer = null;
+				if (this.insertButtonEl) this.insertButtonEl.setText('Insert');
+				this.updateStatus();
+			}
 		}
 	}
 
 	onClose() {
+		this.importer?.cancel();
 		if (this.searchDebounce) {
 			activeWindow.clearTimeout(this.searchDebounce);
 			this.searchDebounce = null;
 		}
+		this.smartSearchRequest++;
+		this.searching = false;
 		this.observer?.disconnect();
 		this.observer = null;
 		this.gridEl = null;
@@ -1647,7 +1692,6 @@ class ImageSelectorModal extends Modal {
 		this.searchEl = null;
 		this.modeEl = null;
 		this.cancelButtonEl = null;
-		this.resetState();
 		this.contentEl.empty();
 	}
 }
