@@ -95,6 +95,10 @@
     font-size: 12px;
 }
 
+.obsidian-immich-loading.is-hidden {
+    display: none;
+}
+
 .obsidian-immich-setting-error {
     display: none;
     padding-top: 4px;

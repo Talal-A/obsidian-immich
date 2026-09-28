@@ -542,7 +542,7 @@ class ImageSelectorModal extends Modal {
 		// Create loading indicator inside scroll container
 		const loadingDiv = this.scrollContainer.createDiv({cls: 'obsidian-immich-loading'});
 		loadingDiv.setText('Loading images...');
-		loadingDiv.style.display = 'none';
+		loadingDiv.addClass('is-hidden');
 
 		// Setup scroll listener with throttling
 		this.setupScrollListener(left, right, totalAssets, loadingDiv);
@@ -590,7 +590,7 @@ class ImageSelectorModal extends Modal {
 		if (!assets) return;
 
 		this.isLoading = true;
-		loadingDiv.style.display = 'block';
+		loadingDiv.removeClass('is-hidden');
 
 		for (let i = startIndex; i < endIndex; i++) {
 			if (this.loadedAssets.has(i)) continue;
@@ -627,9 +627,7 @@ class ImageSelectorModal extends Modal {
 
 		activeWindow.setTimeout(() => {
 			this.isLoading = false;
-			if (endIndex >= totalAssets) {
-				loadingDiv.style.display = 'none';
-			}
+			loadingDiv.addClass('is-hidden');
 		}, 100);
 	}
 
@@ -774,8 +772,7 @@ class SettingTab extends PluginSettingTab {
 						new Notice('Moved ' + migrated.length + ' credential(s) into the keychain: ' + migrated.join(', '));
 						this.display();
 					} catch (error) {
-						console.error('[Immich] Failed to migrate credentials:', error);
-						new Notice('Failed to move credentials into the keychain - check the console for additional information.');
+						new Notice('Failed to move credentials into the keychain. ' + describeException(error));
 						button.setDisabled(false);
 					}
 				});
